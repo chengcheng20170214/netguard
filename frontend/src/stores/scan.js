@@ -34,7 +34,8 @@ export const useScanStore = defineStore('scan', {
       if (this.ws) this.ws.close()
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const host = window.location.host
-      this.ws = new WebSocket(protocol + "//" + host + "/api/ws/scan/" + taskId)
+      const token = localStorage.getItem('token') || ''
+      this.ws = new WebSocket(protocol + "//" + host + "/api/scans/ws/scan/" + taskId + "?token=" + encodeURIComponent(token))
       this.ws.onmessage = (event) => {
         const data = JSON.parse(event.data)
         if (this.currentScan && this.currentScan.id === taskId) {
