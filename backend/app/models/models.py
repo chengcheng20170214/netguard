@@ -1,8 +1,12 @@
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum, Text, JSON, ForeignKey, Float
 from sqlalchemy.orm import relationship
 from app.database import Base
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 
 class UserRole(str, enum.Enum):
@@ -20,8 +24,8 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
     role = Column(Enum(UserRole), default=UserRole.auditor, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
 class ScanStatus(str, enum.Enum):
@@ -79,8 +83,8 @@ class ScanTask(Base):
     next_run = Column(DateTime, default=None)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     started_at = Column(DateTime, default=None)
-    completed_at = Column(DateTime, default=datetime.utcnow)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, default=None)
+    created_at = Column(DateTime, default=_utcnow)
 
 
 class ScanResult(Base):
@@ -94,7 +98,7 @@ class ScanResult(Base):
     os = Column(String(255), default=None)
     ports = Column(JSON, default=list)
     raw_output = Column(Text, default=None)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     scan_task = relationship("ScanTask", backref="results")
 
@@ -111,9 +115,9 @@ class Asset(Base):
     tags = Column(JSON, default=list)
     group_name = Column(String(100), default=None)
     is_online = Column(Boolean, default=True)
-    first_seen = Column(DateTime, default=datetime.utcnow)
-    last_seen = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    first_seen = Column(DateTime, default=_utcnow)
+    last_seen = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
 class AssetSnapshot(Base):
@@ -127,7 +131,7 @@ class AssetSnapshot(Base):
     hostname = Column(String(255), default=None)
     os = Column(String(255), default=None)
     ports = Column(JSON, default=list)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
     asset = relationship("Asset", backref="snapshots")
 
@@ -160,7 +164,7 @@ class AssetChange(Base):
     snapshot_before_id = Column(Integer, default=None)
     snapshot_after_id = Column(Integer, default=None)
     severity = Column(Enum(ChangeSeverity), default=ChangeSeverity.info)
-    detected_at = Column(DateTime, default=datetime.utcnow)
+    detected_at = Column(DateTime, default=_utcnow)
 
     asset = relationship("Asset", backref="changes")
 
@@ -180,8 +184,8 @@ class Vulnerability(Base):
     remediation = Column(Text, default=None)
     scan_task_id = Column(Integer, ForeignKey("scan_tasks.id"), default=None)
     is_false_positive = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     asset = relationship("Asset", backref="vulnerabilities")
 
@@ -194,7 +198,7 @@ class SystemConfig(Base):
     value = Column(Text, nullable=False)
     description = Column(String(255), default=None)
     is_secret = Column(Boolean, default=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
 class VulnDB(Base):
@@ -210,4 +214,4 @@ class VulnDB(Base):
     remediation = Column(Text, default=None)
     published_date = Column(DateTime, default=None)
     last_modified = Column(DateTime, default=None)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=_utcnow)
