@@ -1,8 +1,31 @@
 
 import asyncio
+import ipaddress
+import re
 import xml.etree.ElementTree as ET
 from .base import BaseScanner
 from app.config import settings
+
+
+def validate_targets(targets: str) -> str:
+    """Validate targets contain only valid IPs, CIDR ranges, or hostnames."""
+    parts = [t.strip() for t in targets.split() if t.strip()]
+    validated = []
+    for part in parts:
+        try:
+            ipaddress.ip_network(part, strict=False)
+            validated.append(part)
+            continue
+        except ValueError:
+            pass
+        if re.match(r'^\d{1,3}(\.\d{1,3}){3}-\d{1,3}$', part):
+            validated.append(part)
+            continue
+        if re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$', part) and '..' not in part:
+            validated.append(part)
+            continue
+        raise ValueError(f"Invalid target: {part}")
+    return " ".join(validated)
 
 STEALTH_PROFILES = {
     "stealth_light": {"timing": "-T2", "scan_delay": "400ms", "max_rate": "50", "extra": []},
@@ -21,6 +44,7 @@ METHOD_ARGS = {
 
 class NmapScanner(BaseScanner):
     async def scan(self, targets: str, ports: str | None = None, **kwargs) -> list[dict]:
+        targets = validate_targets(targets)
         scan_method = kwargs.get("scan_method", "nmap_syn")
         scan_mode = kwargs.get("scan_mode", "standard")
         args = [settings.NMAP_PATH]

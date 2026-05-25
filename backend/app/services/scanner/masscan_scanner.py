@@ -1,10 +1,12 @@
 
 import asyncio
 from .base import BaseScanner
+from .nmap_scanner import validate_targets
 from app.config import settings
 
 class MasscanScanner(BaseScanner):
     async def scan(self, targets: str, ports: str | None = None, **kwargs) -> list[dict]:
+        targets = validate_targets(targets)
         scan_mode = kwargs.get("scan_mode", "standard")
         rate = "10000"
         if scan_mode.startswith("stealth_light"):
