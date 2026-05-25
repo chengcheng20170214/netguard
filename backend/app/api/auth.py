@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.models.models import User, UserRole
-from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UserResponse
+from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UserResponse, RefreshRequest
 from app.services.auth import verify_password, get_password_hash, create_access_token, create_refresh_token, decode_token
 from app.middleware.auth import get_current_user, require_role
 
@@ -34,8 +34,8 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db), cur
     return user
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh(refresh_token: str, db: AsyncSession = Depends(get_db)):
-    payload = decode_token(refresh_token)
+async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
+    payload = decode_token(req.refresh_token)
     if not payload or payload.get("type") != "refresh":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的刷新令牌")
     user_id = payload.get("sub")

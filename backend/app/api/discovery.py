@@ -1,12 +1,16 @@
 
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException, status
+import logging
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db, async_session
 from app.models.models import ScanTask, ScanResult, ScanType, ScanStatus, User
 from app.schemas.discovery import ScanRequest, ScanTaskResponse
 from app.middleware.auth import get_current_user
+from app.services.auth import decode_token
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/scans", tags=["资产发现"])
 
@@ -25,22 +29,22 @@ async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
             timeout=3.0
         )
         dispatched = True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to dispatch scan via Celery: {e}")
 
     if not dispatched:
         task.error_message = None
         await db.commit()
         await db.refresh(task)
-        from app.services.scheduler import scheduler_service
-        asyncio.create_task(scheduler_service._execute_scan(task.id))
+        from app.services.scan_executor import execute_scan
+        asyncio.create_task(execute_scan(task.id))
 
     if req.scan_type == ScanType.periodic and req.interval_minutes:
         try:
             from app.services.scheduler import scheduler_service
             scheduler_service.add_periodic_scan(task.id, req.interval_minutes)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to register periodic scan: {e}")
 
 
 @router.post("/", response_model=ScanTaskResponse)
@@ -111,8 +115,8 @@ async def cancel_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_
         try:
             from app.tasks.celery_app import celery_app
             celery_app.control.revoke(task.celery_task_id, terminate=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to revoke celery task {task.celery_task_id}: {e}")
     task.status = ScanStatus.cancelled
     await db.commit()
     return {"message": "扫描任务已取消"}
@@ -133,8 +137,8 @@ async def activate_periodic_scan(scan_id: int, db: AsyncSession = Depends(get_db
     try:
         from app.services.scheduler import scheduler_service
         scheduler_service.add_periodic_scan(task.id, task.interval_minutes)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to activate periodic scan {task.id}: {e}")
     return {"message": "周期扫描已启用"}
 
 
@@ -153,13 +157,20 @@ async def deactivate_periodic_scan(scan_id: int, db: AsyncSession = Depends(get_
     try:
         from app.services.scheduler import scheduler_service
         scheduler_service.remove_periodic_scan(task.id)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to deactivate periodic scan {task.id}: {e}")
     return {"message": "周期扫描已停用"}
 
 
 @router.websocket("/ws/scan/{task_id}")
-async def scan_ws(websocket: WebSocket, task_id: int):
+async def scan_ws(websocket: WebSocket, task_id: int, token: str = Query(default="")):
+    if not token:
+        await websocket.close(code=4001, reason="Missing authentication token")
+        return
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "access":
+        await websocket.close(code=4001, reason="Invalid or expired token")
+        return
     await websocket.accept()
     try:
         while True:

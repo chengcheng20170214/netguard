@@ -5,9 +5,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.database import get_db
 from app.models.models import Asset, AssetChange, AssetSnapshot, User
-from app.schemas.asset import AssetUpdate, AssetChangeResponse, AssetSnapshotResponse
+from app.schemas.asset import AssetUpdate, AssetChangeResponse, AssetSnapshotResponse, AssetImportItem
 from app.middleware.auth import get_current_user
-import json, io, csv
+import json, io, csv, ipaddress, logging
+
+logger = logging.getLogger(__name__)
+MAX_IMPORT_SIZE = 5 * 1024 * 1024
 
 router = APIRouter(prefix="/assets", tags=["资产管理"])
 
@@ -90,11 +93,28 @@ async def export_assets(format: str = "json", db: AsyncSession = Depends(get_db)
 @router.post("/import")
 async def import_assets(file: UploadFile = File(...), db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     content = await file.read()
-    data = json.loads(content)
+    if len(content) > MAX_IMPORT_SIZE:
+        raise HTTPException(status_code=413, detail=f"文件大小超过限制 ({MAX_IMPORT_SIZE // 1024 // 1024}MB)")
+    try:
+        raw = json.loads(content)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="无效的 JSON 文件")
+    items = raw if isinstance(raw, list) else [raw]
     count = 0
-    for item in (data if isinstance(data, list) else [data]):
-        asset = Asset(ip=item["ip"], mac=item.get("mac"), hostname=item.get("hostname"), os=item.get("os"), current_ports=item.get("ports", []), tags=item.get("tags", []), group_name=item.get("group"))
+    skipped = 0
+    for item in items:
+        try:
+            validated = AssetImportItem(**item)
+        except Exception as e:
+            logger.warning(f"Skipping invalid import item: {e}")
+            skipped += 1
+            continue
+        existing = await db.execute(select(Asset).where(Asset.ip == validated.ip))
+        if existing.scalar_one_or_none():
+            skipped += 1
+            continue
+        asset = Asset(ip=validated.ip, mac=validated.mac, hostname=validated.hostname, os=validated.os, current_ports=validated.ports or [], tags=validated.tags or [], group_name=validated.group)
         db.add(asset)
         count += 1
     await db.commit()
-    return {"message": f"已导入 {count} 个资产"}
+    return {"message": f"已导入 {count} 个资产", "skipped": skipped}
