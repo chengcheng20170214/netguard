@@ -1,5 +1,7 @@
 
 from contextlib import asynccontextmanager
+import os
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -9,7 +11,8 @@ from app.models.models import User, UserRole
 from app.services.auth import get_password_hash
 from app.api import auth, users, discovery, assets, vulns, sysconfig
 from sqlalchemy import select
-import os
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -17,30 +20,35 @@ async def lifespan(app: FastAPI):
     async with async_session() as db:
         result = await db.execute(select(User).where(User.username == "admin"))
         if not result.scalar_one_or_none():
-            admin = User(username="admin", email="admin@netguard.local", hashed_password=get_password_hash("netguard123"), role=UserRole.admin, is_active=True)
-            db.add(admin)
-            await db.commit()
+            admin_password = os.getenv("ADMIN_DEFAULT_PASSWORD", "")
+            if not admin_password:
+                logger.warning("ADMIN_DEFAULT_PASSWORD not set, skipping default admin creation.")
+            else:
+                admin = User(username="admin", email="admin@netguard.local", hashed_password=get_password_hash(admin_password), role=UserRole.admin, is_active=True)
+                db.add(admin)
+                await db.commit()
+                logger.info("Default admin user created. Please change the password after first login.")
     try:
         from app.services.scheduler import scheduler_service
         await scheduler_service.start()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to start scheduler: {e}")
     try:
         from app.services.vuln_service import vuln_scheduler
         await vuln_scheduler.start()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to start vuln scheduler: {e}")
     yield
     try:
         from app.services.scheduler import scheduler_service
         await scheduler_service.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to stop scheduler: {e}")
     try:
         from app.services.vuln_service import vuln_scheduler
         await vuln_scheduler.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to stop vuln scheduler: {e}")
 
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
 
@@ -48,8 +56,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(auth.router, prefix="/api")
