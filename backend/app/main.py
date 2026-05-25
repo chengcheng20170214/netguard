@@ -7,7 +7,7 @@ from app.config import settings
 from app.database import init_db, async_session
 from app.models.models import User, UserRole
 from app.services.auth import get_password_hash
-from app.api import auth, users, discovery, assets, vulns, settings
+from app.api import auth, users, discovery, assets, vulns, sysconfig
 from sqlalchemy import select
 import os
 
@@ -20,7 +20,27 @@ async def lifespan(app: FastAPI):
             admin = User(username="admin", email="admin@netguard.local", hashed_password=get_password_hash("netguard123"), role=UserRole.admin, is_active=True)
             db.add(admin)
             await db.commit()
+    try:
+        from app.services.scheduler import scheduler_service
+        await scheduler_service.start()
+    except Exception:
+        pass
+    try:
+        from app.services.vuln_service import vuln_scheduler
+        await vuln_scheduler.start()
+    except Exception:
+        pass
     yield
+    try:
+        from app.services.scheduler import scheduler_service
+        await scheduler_service.stop()
+    except Exception:
+        pass
+    try:
+        from app.services.vuln_service import vuln_scheduler
+        await vuln_scheduler.stop()
+    except Exception:
+        pass
 
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
 
@@ -37,6 +57,7 @@ app.include_router(users.router, prefix="/api")
 app.include_router(discovery.router, prefix="/api")
 app.include_router(assets.router, prefix="/api")
 app.include_router(vulns.router, prefix="/api")
+app.include_router(sysconfig.router, prefix="/api")
 
 @app.get("/api/health")
 async def health():

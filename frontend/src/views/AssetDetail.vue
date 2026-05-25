@@ -26,7 +26,7 @@
         <el-timeline>
           <el-timeline-item v-for="c in changes" :key="c.id" :timestamp="c.detected_at" :color="changeColor(c.change_type)">
             <el-tag :type="changeTypeColor(c.change_type)" size="small">{{ changeTypeLabel(c.change_type) }}</el-tag>
-            <span style="margin-left:8px">{{ c.detail }}</span>
+            <span style="margin-left:8px">{{ formatChangeDetail(c) }}</span>
           </el-timeline-item>
         </el-timeline>
       </el-tab-pane>
@@ -59,9 +59,24 @@ const vulns = ref([])
 
 const goBack = () => { router.push('/assets') }
 
-const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更' }[t] || t)
-const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info' }[t] || 'info')
-const changeColor = (t) => ({ new_host: '#67C23A', host_down: '#F56C6C', new_service: '#409EFF', service_closed: '#E6A23C', version_changed: '#E6A23C' }[t] || '#909399')
+const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更', mac_changed: 'MAC变更', hostname_changed: '主机名变更' }[t] || t)
+const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info', mac_changed: 'info', hostname_changed: 'info' }[t] || 'info')
+const changeColor = (t) => ({ new_host: '#67C23A', host_down: '#F56C6C', new_service: '#409EFF', service_closed: '#E6A23C', version_changed: '#E6A23C', mac_changed: '#909399', hostname_changed: '#909399' }[t] || '#909399')
+
+const formatChangeDetail = (c) => {
+  const d = c.detail || {}
+  switch (c.change_type) {
+    case 'new_service': return `端口 ${d.port}/${d.proto || 'tcp'} 服务: ${d.service || '未知'}`
+    case 'service_closed': return `端口 ${d.port}/${d.proto || 'tcp'} 服务: ${d.service || '未知'}`
+    case 'version_changed': return `端口 ${d.port} ${d.service || ''}: ${d.old_version || '?'} → ${d.new_version || '?'}`
+    case 'os_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'hostname_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'mac_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'new_host': return '新发现主机'
+    case 'host_down': return '主机下线'
+    default: return JSON.stringify(d)
+  }
+}
 const severityType = (s) => ({ Critical: 'danger', High: 'warning', Medium: '', Low: 'info' }[s] || 'info')
 
 onMounted(async () => {

@@ -17,6 +17,9 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Database
+*.db
+
 # Env
 .env
 *.local

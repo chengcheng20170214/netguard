@@ -41,6 +41,11 @@ class ScanMode(str, enum.Enum):
     custom = "custom"
 
 
+class ScanType(str, enum.Enum):
+    one_time = "one_time"
+    periodic = "periodic"
+
+
 class ScanMethod(str, enum.Enum):
     nmap_syn = "nmap_syn"
     nmap_connect = "nmap_connect"
@@ -59,17 +64,22 @@ class ScanTask(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200), nullable=False)
     targets = Column(Text, nullable=False)
+    scan_type = Column(Enum(ScanType), default=ScanType.one_time, nullable=False)
     scan_mode = Column(Enum(ScanMode), default=ScanMode.standard, nullable=False)
     scan_methods = Column(JSON, default=list)
     ports = Column(String(200), default=None)
+    interval_minutes = Column(Integer, default=None)
+    is_active = Column(Boolean, default=True)
     status = Column(Enum(ScanStatus), default=ScanStatus.pending, nullable=False)
     progress = Column(Integer, default=0)
     celery_task_id = Column(String(255), default=None)
     result_summary = Column(JSON, default=dict)
     error_message = Column(Text, default=None)
+    last_run = Column(DateTime, default=None)
+    next_run = Column(DateTime, default=None)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     started_at = Column(DateTime, default=None)
-    completed_at = Column(DateTime, default=None)
+    completed_at = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -185,3 +195,19 @@ class SystemConfig(Base):
     description = Column(String(255), default=None)
     is_secret = Column(Boolean, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class VulnDB(Base):
+    __tablename__ = "vuln_db"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cve_id = Column(String(20), nullable=False, index=True)
+    cve_description = Column(Text, default=None)
+    cvss_score = Column(Float, default=None)
+    cvss_version = Column(String(10), default=None)
+    severity = Column(String(20), default=None)
+    affected_products = Column(JSON, default=list)
+    remediation = Column(Text, default=None)
+    published_date = Column(DateTime, default=None)
+    last_modified = Column(DateTime, default=None)
+    fetched_at = Column(DateTime, default=datetime.utcnow)

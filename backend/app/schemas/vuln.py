@@ -1,3 +1,4 @@
+from datetime import datetime
 
 from pydantic import BaseModel
 
@@ -12,10 +13,14 @@ class VulnerabilityResponse(BaseModel):
     affected_version: str | None = None
     remediation: str | None = None
     is_false_positive: bool = False
-    created_at: str | None = None
+    created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
 class VulnScanRequest(BaseModel):
     asset_id: int
     scan_task_id: int | None = None
+
+class VulnAutoScanConfig(BaseModel):
+    enabled: bool = True
+    interval_hours: int = 24

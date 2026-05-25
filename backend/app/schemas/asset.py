@@ -1,3 +1,4 @@
+from datetime import datetime
 
 from pydantic import BaseModel
 from app.models.models import ChangeType, ChangeSeverity
@@ -12,8 +13,8 @@ class AssetResponse(BaseModel):
     tags: list | None = None
     group_name: str | None = None
     is_online: bool = True
-    first_seen: str | None = None
-    last_seen: str | None = None
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -28,7 +29,7 @@ class AssetChangeResponse(BaseModel):
     change_type: ChangeType
     detail: dict
     severity: ChangeSeverity = ChangeSeverity.info
-    detected_at: str | None = None
+    detected_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -40,6 +41,6 @@ class AssetSnapshotResponse(BaseModel):
     hostname: str | None = None
     os: str | None = None
     ports: list | None = None
-    created_at: str | None = None
+    created_at: datetime | None = None
 
     model_config = {"from_attributes": True}

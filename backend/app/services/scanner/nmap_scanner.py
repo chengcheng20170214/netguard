@@ -34,10 +34,14 @@ class NmapScanner(BaseScanner):
             args.extend(["--scan-delay", profile["scan_delay"]])
             args.extend(["--max-rate", profile["max_rate"]])
             args.extend(profile["extra"])
+            if not ports:
+                args.extend(["-p", "1-65535"])
         elif scan_mode == "quick":
             args.extend(["-T4", "--top-ports", "100"])
         else:
             args.append("-T4")
+            if not ports:
+                args.extend(["-p", "1-65535"])
 
         if ports:
             args.extend(["-p", ports])

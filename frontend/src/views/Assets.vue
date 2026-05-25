@@ -48,10 +48,15 @@
       <template #header><span>近期变更</span></template>
       <el-table :data="recentChanges" stripe border size="small">
         <el-table-column prop="ip" label="IP" width="150" />
-        <el-table-column prop="change_type" label="变更类型" width="150">
+        <el-table-column prop="change_type" label="变更类型" width="120">
           <template #default="{ row }"><el-tag :type="changeTypeColor(row.change_type)" size="small">{{ changeTypeLabel(row.change_type) }}</el-tag></template>
         </el-table-column>
-        <el-table-column prop="detail" label="详情" show-overflow-tooltip />
+        <el-table-column label="变更详情" min-width="250">
+          <template #default="{ row }">{{ formatChangeDetail(row) }}</template>
+        </el-table-column>
+        <el-table-column prop="severity" label="级别" width="80">
+          <template #default="{ row }"><el-tag :type="severityColor(row.severity)" size="small">{{ severityLabel(row.severity) }}</el-tag></template>
+        </el-table-column>
         <el-table-column prop="detected_at" label="检测时间" width="180" />
       </el-table>
     </el-card>
@@ -69,8 +74,25 @@ const assets = ref([])
 const recentChanges = ref([])
 const filters = reactive({ ip: '', group: '', is_online: null })
 
-const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更' }[t] || t)
-const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info' }[t] || 'info')
+const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更', mac_changed: 'MAC变更', hostname_changed: '主机名变更' }[t] || t)
+const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info', mac_changed: 'info', hostname_changed: 'info' }[t] || 'info')
+const severityColor = (s) => ({ info: '', warning: 'warning', critical: 'danger' }[s] || 'info')
+const severityLabel = (s) => ({ info: '信息', warning: '警告', critical: '严重' }[s] || s)
+
+const formatChangeDetail = (row) => {
+  const d = row.detail || {}
+  switch (row.change_type) {
+    case 'new_service': return `端口 ${d.port}/${d.proto || 'tcp'} 服务: ${d.service || '未知'}`
+    case 'service_closed': return `端口 ${d.port}/${d.proto || 'tcp'} 服务: ${d.service || '未知'}`
+    case 'version_changed': return `端口 ${d.port} ${d.service || ''}: ${d.old_version || '?'} → ${d.new_version || '?'}`
+    case 'os_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'hostname_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'mac_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'new_host': return '新发现主机'
+    case 'host_down': return '主机下线'
+    default: return JSON.stringify(d)
+  }
+}
 
 const fetchData = async () => {
   try {
