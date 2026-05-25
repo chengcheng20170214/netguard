@@ -1,6 +1,6 @@
 
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from app.models.models import UserRole
 
 class LoginRequest(BaseModel):
@@ -12,6 +12,13 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     role: UserRole = UserRole.auditor
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v):
+        if len(v) < 15:
+            raise ValueError("密码长度不得少于15位")
+        return v
 
 class TokenResponse(BaseModel):
     access_token: str

@@ -23,6 +23,8 @@ async def lifespan(app: FastAPI):
             admin_password = os.getenv("ADMIN_DEFAULT_PASSWORD", "")
             if not admin_password:
                 logger.warning("ADMIN_DEFAULT_PASSWORD not set, skipping default admin creation.")
+            elif len(admin_password) < 15:
+                logger.error("ADMIN_DEFAULT_PASSWORD must be at least 15 characters. Refusing to create admin with weak password.")
             else:
                 admin = User(username="admin", email="admin@netguard.local", hashed_password=get_password_hash(admin_password), role=UserRole.admin, is_active=True)
                 db.add(admin)
