@@ -1,7 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from app.models.models import ChangeType, ChangeSeverity
+import ipaddress
 
 class AssetResponse(BaseModel):
     id: int
@@ -44,3 +45,21 @@ class AssetSnapshotResponse(BaseModel):
     created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
+
+class AssetImportItem(BaseModel):
+    ip: str
+    mac: str | None = None
+    hostname: str | None = None
+    os: str | None = None
+    ports: list | None = None
+    tags: list | None = None
+    group: str | None = None
+
+    @field_validator("ip")
+    @classmethod
+    def validate_ip(cls, v):
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            raise ValueError(f"Invalid IP address: {v}")
+        return v
