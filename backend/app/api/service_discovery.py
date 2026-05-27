@@ -5,14 +5,16 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPExce
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db, async_session
-from app.models.models import ScanTask, ScanResult, ScanType, ScanStatus, User
+from app.models.models import ScanTask, ScanResult, ScanType, ScanStatus, ScanCategory, ScanMethod, User
 from app.schemas.discovery import ScanRequest, ScanTaskResponse, ScanResultResponse, ScanUpdateRequest
 from app.middleware.auth import get_current_user
 from app.services.auth import decode_token
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/scans", tags=["资产发现"])
+router = APIRouter(prefix="/api/service-scans", tags=["服务发现"])
+
+SERVICE_METHODS = {ScanMethod.nmap_syn, ScanMethod.nmap_syn_full, ScanMethod.nmap_connect, ScanMethod.nmap_udp, ScanMethod.nmap_service, ScanMethod.nmap_os, ScanMethod.nmap_script}
 
 
 async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
@@ -49,8 +51,13 @@ async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
 
 
 @router.post("/", response_model=ScanTaskResponse)
-async def create_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Create a scan task (one-time or periodic)."""
+async def create_service_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Create a service discovery scan task."""
+    # Force service discovery category and validate methods
+    req.scan_category = ScanCategory.service_discovery
+    for m in req.scan_methods:
+        if m not in SERVICE_METHODS:
+            raise HTTPException(status_code=422, detail=f"服务发现不支持扫描方法: {m.value}，仅支持端口扫描和服务识别方法")
     if req.scan_type == ScanType.periodic and (not req.interval_minutes or req.interval_minutes < 1):
         raise HTTPException(status_code=422, detail="周期扫描必须设置间隔时间（分钟）")
 
@@ -59,8 +66,8 @@ async def create_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), curr
         next_run = datetime.now(timezone.utc) + timedelta(minutes=req.interval_minutes)
 
     task = ScanTask(
-        name=req.name, targets=req.targets, scan_type=req.scan_type,
-        scan_mode=req.scan_mode,
+        name=req.name, targets=req.targets, scan_category=ScanCategory.service_discovery,
+        scan_type=req.scan_type, scan_mode=req.scan_mode,
         scan_methods=[m.value for m in req.scan_methods],
         ports=req.ports, interval_minutes=req.interval_minutes,
         created_by=current_user.id, next_run=next_run,
@@ -76,14 +83,14 @@ async def create_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), curr
 
 
 @router.get("/")
-async def list_scans(
+async def list_service_scans(
     scan_type: ScanType | None = None,
     skip: int = 0, limit: int = 50,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """List scan tasks, optionally filtered by scan_type."""
-    query = select(ScanTask).order_by(ScanTask.created_at.desc()).offset(skip).limit(limit)
+    """List service discovery scan tasks."""
+    query = select(ScanTask).where(ScanTask.scan_category == ScanCategory.service_discovery).order_by(ScanTask.created_at.desc()).offset(skip).limit(limit)
     if scan_type:
         query = query.where(ScanTask.scan_type == scan_type)
     result = await db.execute(query)
@@ -92,7 +99,7 @@ async def list_scans(
 
 
 @router.get("/{scan_id}")
-async def get_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def get_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
     task = result.scalar_one_or_none()
     if not task:
@@ -105,8 +112,8 @@ async def get_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_use
 
 
 @router.put("/{scan_id}", response_model=ScanTaskResponse)
-async def update_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Update a scan task. Only tasks in pending/completed/cancelled/failed status can be edited."""
+async def update_service_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Update a service discovery scan task. Running tasks cannot be edited."""
     result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
     task = result.scalar_one_or_none()
     if not task:
@@ -126,7 +133,6 @@ async def update_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSession = D
         task.ports = req.ports
     if req.interval_minutes is not None:
         task.interval_minutes = req.interval_minutes
-        # If periodic and active, update the scheduler
         if task.scan_type == ScanType.periodic and task.is_active:
             task.next_run = datetime.now(timezone.utc) + timedelta(minutes=req.interval_minutes)
             try:
@@ -142,7 +148,7 @@ async def update_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSession = D
 
 
 @router.post("/{scan_id}/cancel")
-async def cancel_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def cancel_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
     task = result.scalar_one_or_none()
     if not task:
@@ -165,8 +171,8 @@ async def cancel_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_
 
 
 @router.post("/{scan_id}/activate")
-async def activate_periodic_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Activate a periodic scan schedule."""
+async def activate_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Activate a periodic service discovery scan."""
     result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
     task = result.scalar_one_or_none()
     if not task:
@@ -185,8 +191,8 @@ async def activate_periodic_scan(scan_id: int, db: AsyncSession = Depends(get_db
 
 
 @router.post("/{scan_id}/deactivate")
-async def deactivate_periodic_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Deactivate a periodic scan schedule."""
+async def deactivate_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Deactivate a periodic service discovery scan."""
     result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
     task = result.scalar_one_or_none()
     if not task:

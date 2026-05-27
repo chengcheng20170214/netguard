@@ -25,6 +25,14 @@ def _ports_to_dict(ports: list) -> dict:
 async def compare_snapshots(db: AsyncSession, before: AssetSnapshot, after: AssetSnapshot) -> list[AssetChange]:
     changes = []
 
+    if before.ip != after.ip and after.ip:
+        changes.append(AssetChange(
+            asset_id=after.asset_id, ip=after.ip, change_type=ChangeType.ip_changed,
+            detail={"field": "ip", "old": before.ip, "new": after.ip},
+            snapshot_before_id=before.id, snapshot_after_id=after.id,
+            severity=ChangeSeverity.info, detected_at=datetime.now(timezone.utc)
+        ))
+
     if before.os != after.os and after.os:
         changes.append(AssetChange(
             asset_id=after.asset_id, ip=after.ip, change_type=ChangeType.os_changed,

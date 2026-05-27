@@ -31,8 +31,13 @@ class Settings(BaseSettings):
 
     # Scanner paths
     NMAP_PATH: str = os.getenv("NMAP_PATH", "/usr/bin/nmap")
-    MASSCAN_PATH: str = os.getenv("MASSCAN_PATH", "/usr/bin/masscan")
-    FPING_PATH: str = os.getenv("FPING_PATH", "/usr/bin/fping")
+
+    # SYN full-port scan tuning (防中断、防遗漏)
+    SCAN_CHUNK_SIZE: int = int(os.getenv("SCAN_CHUNK_SIZE", "5000"))  # 每块端口数
+    SCAN_MAX_RETRIES: int = int(os.getenv("SCAN_MAX_RETRIES", "6"))   # 最大重传次数
+    SCAN_MIN_RATE: int = int(os.getenv("SCAN_MIN_RATE", "300"))       # 最低发包速率/秒
+    SCAN_HOST_TIMEOUT_MIN: int = int(os.getenv("SCAN_HOST_TIMEOUT_MIN", "60"))  # 单主机超时(分钟)
+    SCAN_CHUNK_MAX_RETRIES: int = int(os.getenv("SCAN_CHUNK_MAX_RETRIES", "3"))  # 失败块最大重试次数
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]

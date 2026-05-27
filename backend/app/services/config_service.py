@@ -16,8 +16,6 @@ CONFIG_DEFAULTS = {
     "nvd_api_key": {"value": "", "description": "NVD API key (optional, increases rate limit)", "is_secret": True},
     "nvd_api_url": {"value": "https://services.nvd.nist.gov/rest/json/cves/2.0", "description": "NVD API endpoint", "is_secret": False},
     "nmap_path": {"value": "/usr/bin/nmap", "description": "nmap binary path", "is_secret": False},
-    "masscan_path": {"value": "/usr/bin/masscan", "description": "masscan binary path", "is_secret": False},
-    "fping_path": {"value": "/usr/bin/fping", "description": "fping binary path", "is_secret": False},
     "cors_origins": {"value": "http://localhost:5173,http://localhost:3000", "description": "CORS allowed origins (comma separated)", "is_secret": False},
     "debug": {"value": "true", "description": "Debug mode", "is_secret": False},
     "scan_default_timeout": {"value": "3600", "description": "Default scan timeout (seconds)", "is_secret": False},

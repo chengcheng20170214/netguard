@@ -13,3 +13,8 @@ export const importAssets = (file) => {
   formData.append('file', file)
   return api.post('/assets/import', formData, { headers: { 'Content-Type': 'multipart/form-data' } })
 }
+export const getKnownServices = (params) => api.get('/assets/services/', { params })
+export const createKnownService = (data) => api.post('/assets/services/', data)
+export const deleteKnownService = (id) => api.delete('/assets/services/' + id)
+export const getAssetTargets = () => api.get('/assets/targets')
+export const seedKnownServices = () => api.post('/assets/services/seed')

@@ -3,7 +3,8 @@ import { createRouter, createWebHistory } from 'vue-router'
 const routes = [
   { path: '/login', name: 'Login', component: () => import('../views/Login.vue'), meta: { requiresAuth: false } },
   { path: '/', name: 'Dashboard', component: () => import('../views/Dashboard.vue'), meta: { requiresAuth: true } },
-  { path: '/discovery', name: 'Discovery', component: () => import('../views/Discovery.vue'), meta: { requiresAuth: true, roles: ['admin', 'auditor'] } },
+  { path: '/host-discovery', name: 'HostDiscovery', component: () => import('../views/HostDiscovery.vue'), meta: { requiresAuth: true, roles: ['admin', 'auditor'] } },
+  { path: '/service-discovery', name: 'ServiceDiscovery', component: () => import('../views/ServiceDiscovery.vue'), meta: { requiresAuth: true, roles: ['admin', 'auditor'] } },
   { path: '/assets', name: 'Assets', component: () => import('../views/Assets.vue'), meta: { requiresAuth: true } },
   { path: '/assets/:id', name: 'AssetDetail', component: () => import('../views/AssetDetail.vue'), meta: { requiresAuth: true } },
   { path: '/vulns', name: 'Vulns', component: () => import('../views/Vulns.vue'), meta: { requiresAuth: true } },

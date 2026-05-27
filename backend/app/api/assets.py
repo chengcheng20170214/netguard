@@ -4,8 +4,8 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.database import get_db
-from app.models.models import Asset, AssetChange, AssetSnapshot, User
-from app.schemas.asset import AssetUpdate, AssetChangeResponse, AssetSnapshotResponse, AssetImportItem
+from app.models.models import Asset, AssetChange, AssetSnapshot, User, KnownService
+from app.schemas.asset import AssetUpdate, AssetChangeResponse, AssetSnapshotResponse, AssetImportItem, KnownServiceCreate, KnownServiceResponse
 from app.middleware.auth import get_current_user
 import json, io, csv, ipaddress, logging
 
@@ -28,6 +28,14 @@ async def list_assets(ip: str | None = None, group: str | None = None, is_online
     result = await db.execute(query.order_by(Asset.last_seen.desc()).offset(skip).limit(limit))
     assets = result.scalars().all()
     return {"total": total, "items": assets}
+
+@router.get("/targets")
+async def get_asset_targets(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return all assets' IP list for scan target selection."""
+    result = await db.execute(select(Asset.id, Asset.ip, Asset.hostname, Asset.is_online).order_by(Asset.ip))
+    rows = result.all()
+    return [{"id": r.id, "ip": r.ip, "hostname": r.hostname, "is_online": r.is_online} for r in rows]
+
 
 @router.get("/changes")
 async def all_changes(skip: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -109,12 +117,67 @@ async def import_assets(file: UploadFile = File(...), db: AsyncSession = Depends
             logger.warning(f"Skipping invalid import item: {e}")
             skipped += 1
             continue
-        existing = await db.execute(select(Asset).where(Asset.ip == validated.ip))
-        if existing.scalar_one_or_none():
+        existing = None
+        if validated.mac or (validated.hostname and validated.os):
+            import hashlib
+            if validated.mac:
+                raw = f"mac:{validated.mac}"
+            else:
+                raw = f"host:{validated.hostname}|os:{validated.os}"
+            fp = hashlib.sha256(raw.encode()).hexdigest()
+            fp_result = await db.execute(select(Asset).where(Asset.fingerprint == fp))
+            existing = fp_result.scalar_one_or_none()
+        if not existing:
+            ip_result = await db.execute(select(Asset).where(Asset.ip == validated.ip))
+            existing = ip_result.scalar_one_or_none()
+        if existing:
             skipped += 1
             continue
-        asset = Asset(ip=validated.ip, mac=validated.mac, hostname=validated.hostname, os=validated.os, current_ports=validated.ports or [], tags=validated.tags or [], group_name=validated.group)
+        fp_val = None
+        if validated.mac or (validated.hostname and validated.os):
+            import hashlib
+            raw = f"mac:{validated.mac}" if validated.mac else f"host:{validated.hostname}|os:{validated.os}"
+            fp_val = hashlib.sha256(raw.encode()).hexdigest()
+        asset = Asset(ip=validated.ip, mac=validated.mac, hostname=validated.hostname, os=validated.os, fingerprint=fp_val, current_ports=validated.ports or [], tags=validated.tags or [], group_name=validated.group)
         db.add(asset)
         count += 1
     await db.commit()
     return {"message": f"已导入 {count} 个资产", "skipped": skipped}
+
+
+@router.get("/services/", response_model=list[KnownServiceResponse])
+async def list_known_services(category: str | None = None, risk: str | None = None, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    query = select(KnownService).order_by(KnownService.port)
+    if category:
+        query = query.where(KnownService.category == category)
+    if risk:
+        query = query.where(KnownService.risk == risk)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+@router.post("/services/", response_model=KnownServiceResponse)
+async def create_known_service(data: KnownServiceCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    svc = KnownService(**data.model_dump())
+    db.add(svc)
+    await db.commit()
+    await db.refresh(svc)
+    return svc
+
+
+@router.delete("/services/{service_id}")
+async def delete_known_service(service_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    result = await db.execute(select(KnownService).where(KnownService.id == service_id))
+    svc = result.scalar_one_or_none()
+    if not svc:
+        raise HTTPException(status_code=404, detail="服务定义不存在")
+    await db.delete(svc)
+    await db.commit()
+    return {"message": "服务定义已删除"}
+
+
+@router.post("/services/seed")
+async def seed_services(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from app.services.known_services import seed_known_services
+    count = await seed_known_services(db)
+    return {"message": f"已导入 {count} 个已知服务定义"}

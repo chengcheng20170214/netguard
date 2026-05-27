@@ -52,14 +52,19 @@ class ScanType(str, enum.Enum):
 
 class ScanMethod(str, enum.Enum):
     nmap_syn = "nmap_syn"
+    nmap_syn_full = "nmap_syn_full"
     nmap_connect = "nmap_connect"
     nmap_udp = "nmap_udp"
     nmap_service = "nmap_service"
     nmap_os = "nmap_os"
     nmap_script = "nmap_script"
-    masscan = "masscan"
-    fping = "fping"
-    arp_scan = "arp_scan"
+    nmap_ping = "nmap_ping"
+    nmap_arp = "nmap_arp"
+
+
+class ScanCategory(str, enum.Enum):
+    host_discovery = "host_discovery"
+    service_discovery = "service_discovery"
 
 
 class ScanTask(Base):
@@ -68,6 +73,7 @@ class ScanTask(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200), nullable=False)
     targets = Column(Text, nullable=False)
+    scan_category = Column(Enum(ScanCategory), default=ScanCategory.host_discovery, nullable=False)
     scan_type = Column(Enum(ScanType), default=ScanType.one_time, nullable=False)
     scan_mode = Column(Enum(ScanMode), default=ScanMode.standard, nullable=False)
     scan_methods = Column(JSON, default=list)
@@ -78,6 +84,7 @@ class ScanTask(Base):
     progress = Column(Integer, default=0)
     celery_task_id = Column(String(255), default=None)
     result_summary = Column(JSON, default=dict)
+    scan_log = Column(JSON, default=list)
     error_message = Column(Text, default=None)
     last_run = Column(DateTime, default=None)
     next_run = Column(DateTime, default=None)
@@ -108,6 +115,7 @@ class Asset(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     ip = Column(String(45), nullable=False, index=True)
+    fingerprint = Column(String(64), unique=True, index=True, nullable=True)
     mac = Column(String(17), default=None)
     hostname = Column(String(255), default=None)
     os = Column(String(255), default=None)
@@ -145,6 +153,7 @@ class ChangeType(str, enum.Enum):
     os_changed = "os_changed"
     mac_changed = "mac_changed"
     hostname_changed = "hostname_changed"
+    ip_changed = "ip_changed"
 
 
 class ChangeSeverity(str, enum.Enum):
@@ -215,3 +224,39 @@ class VulnDB(Base):
     published_date = Column(DateTime, default=None)
     last_modified = Column(DateTime, default=None)
     fetched_at = Column(DateTime, default=_utcnow)
+
+
+class ScanChunkStatus(str, enum.Enum):
+    pending = "pending"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+class ScanChunk(Base):
+    __tablename__ = "scan_chunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scan_task_id = Column(Integer, ForeignKey("scan_tasks.id"), nullable=False, index=True)
+    port_start = Column(Integer, nullable=False)
+    port_end = Column(Integer, nullable=False)
+    status = Column(Enum(ScanChunkStatus), default=ScanChunkStatus.pending, nullable=False)
+    retry_count = Column(Integer, default=0)
+    open_ports = Column(JSON, default=list)
+    error_message = Column(Text, default=None)
+    started_at = Column(DateTime, default=None)
+    completed_at = Column(DateTime, default=None)
+
+    scan_task = relationship("ScanTask", backref="chunks")
+
+
+class KnownService(Base):
+    __tablename__ = "known_services"
+
+    id = Column(Integer, primary_key=True, index=True)
+    port = Column(Integer, nullable=False, index=True)
+    proto = Column(String(10), default="tcp", nullable=False)
+    name = Column(String(50), nullable=False)
+    category = Column(String(50), default="other")
+    risk = Column(String(20), default="low")
+    description = Column(String(255), default=None)

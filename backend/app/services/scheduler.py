@@ -55,6 +55,8 @@ class SchedulerService:
         from sqlalchemy import select
 
         while self._running:
+            await asyncio.sleep(interval_minutes * 60)
+
             try:
                 async with async_session() as db:
                     result = await db.execute(select(ScanTask).where(ScanTask.id == scan_task_id))
@@ -80,8 +82,16 @@ class SchedulerService:
                 break
             except Exception as e:
                 logger.error(f"Periodic scan {scan_task_id} error: {e}")
-
-            await asyncio.sleep(interval_minutes * 60)
+                try:
+                    async with async_session() as db:
+                        result = await db.execute(select(ScanTask).where(ScanTask.id == scan_task_id))
+                        task = result.scalar_one_or_none()
+                        if task and task.status == ScanStatus.running:
+                            task.status = ScanStatus.failed
+                            task.error_message = f"Periodic scan error: {e}"
+                            await db.commit()
+                except Exception:
+                    pass
 
         self._periodic_tasks.pop(scan_task_id, None)
 

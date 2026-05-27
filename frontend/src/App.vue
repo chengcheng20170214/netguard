@@ -8,9 +8,13 @@
             <el-icon><Monitor /></el-icon>
             <span>仪表盘</span>
           </el-menu-item>
-          <el-menu-item index="/discovery">
+          <el-menu-item index="/host-discovery">
             <el-icon><Search /></el-icon>
-            <span>资产发现</span>
+            <span>主机发现</span>
+          </el-menu-item>
+          <el-menu-item index="/service-discovery">
+            <el-icon><Connection /></el-icon>
+            <span>服务发现</span>
           </el-menu-item>
           <el-menu-item index="/assets">
             <el-icon><Files /></el-icon>
@@ -50,7 +54,7 @@
 <script setup>
 import { computed } from 'vue'
 import { useAuthStore } from './stores/auth'
-import { Monitor, Search, Files, Warning, User, Setting } from '@element-plus/icons-vue'
+import { Monitor, Search, Files, Warning, User, Setting, Connection } from '@element-plus/icons-vue'
 
 const authStore = useAuthStore()
 const token = computed(() => authStore.token)

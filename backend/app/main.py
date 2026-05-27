@@ -9,7 +9,7 @@ from app.config import settings
 from app.database import init_db, async_session
 from app.models.models import User, UserRole
 from app.services.auth import get_password_hash
-from app.api import auth, users, discovery, assets, vulns, sysconfig
+from app.api import auth, users, discovery, host_discovery, service_discovery, assets, vulns, sysconfig
 from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,8 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(discovery.router, prefix="/api")
+app.include_router(host_discovery.router)
+app.include_router(service_discovery.router)
 app.include_router(assets.router, prefix="/api")
 app.include_router(vulns.router, prefix="/api")
 app.include_router(sysconfig.router, prefix="/api")

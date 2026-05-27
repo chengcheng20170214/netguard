@@ -24,9 +24,9 @@
         <el-table-column prop="hostname" label="主机名" width="150" />
         <el-table-column prop="mac" label="MAC" width="150" />
         <el-table-column prop="os" label="操作系统" width="150" show-overflow-tooltip />
-        <el-table-column label="开放端口" min-width="200">
+        <el-table-column label="开放端口" min-width="250">
           <template #default="{ row }">
-            <span v-for="p in (row.current_ports || [])" :key="p.port" style="margin-right:6px">{{ p.port }}</span>
+            <el-tag v-for="p in (row.current_ports || [])" :key="p.port" :type="isCriticalService(p.service) ? 'danger' : 'info'" size="small" style="margin-right:4px;margin-bottom:2px">{{ p.port }}/{{ p.service || '?' }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="标签" width="150">
@@ -74,8 +74,8 @@ const assets = ref([])
 const recentChanges = ref([])
 const filters = reactive({ ip: '', group: '', is_online: null })
 
-const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更', mac_changed: 'MAC变更', hostname_changed: '主机名变更' }[t] || t)
-const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info', mac_changed: 'info', hostname_changed: 'info' }[t] || 'info')
+const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更', mac_changed: 'MAC变更', hostname_changed: '主机名变更', ip_changed: 'IP变更' }[t] || t)
+const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info', mac_changed: 'info', hostname_changed: 'info', ip_changed: 'warning' }[t] || 'info')
 const severityColor = (s) => ({ info: '', warning: 'warning', critical: 'danger' }[s] || 'info')
 const severityLabel = (s) => ({ info: '信息', warning: '警告', critical: '严重' }[s] || s)
 
@@ -88,6 +88,7 @@ const formatChangeDetail = (row) => {
     case 'os_changed': return `${d.old || '?'} → ${d.new || '?'}`
     case 'hostname_changed': return `${d.old || '?'} → ${d.new || '?'}`
     case 'mac_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'ip_changed': return `${d.old || '?'} → ${d.new || '?'}`
     case 'new_host': return '新发现主机'
     case 'host_down': return '主机下线'
     default: return JSON.stringify(d)
@@ -110,6 +111,8 @@ const handleDelete = async (row) => {
   ElMessage.success('已删除')
   fetchData()
 }
+
+const isCriticalService = (svc) => ['ssh', 'mysql', 'rdp', 'redis', 'mongodb', 'mssql', 'postgresql', 'smb', 'vnc', 'telnet'].includes((svc || '').toLowerCase())
 
 const handleExport = async (format) => {
   const res = await exportAssets(format)

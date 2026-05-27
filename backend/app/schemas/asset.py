@@ -7,6 +7,7 @@ import ipaddress
 class AssetResponse(BaseModel):
     id: int
     ip: str
+    fingerprint: str | None = None
     mac: str | None = None
     hostname: str | None = None
     os: str | None = None
@@ -63,3 +64,24 @@ class AssetImportItem(BaseModel):
         except ValueError:
             raise ValueError(f"Invalid IP address: {v}")
         return v
+
+
+class KnownServiceResponse(BaseModel):
+    id: int
+    port: int
+    proto: str = "tcp"
+    name: str
+    category: str = "other"
+    risk: str = "low"
+    description: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class KnownServiceCreate(BaseModel):
+    port: int
+    proto: str = "tcp"
+    name: str
+    category: str = "other"
+    risk: str = "low"
+    description: str | None = None

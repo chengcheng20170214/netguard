@@ -78,7 +78,7 @@ const activeTab = ref('db')
 
 const dbKeys = ['database_url', 'redis_url', 'celery_broker_url', 'celery_result_backend']
 const authKeys = ['jwt_secret_key', 'jwt_algorithm', 'access_token_expire_minutes', 'refresh_token_expire_days']
-const scannerKeys = ['nmap_path', 'masscan_path', 'fping_path', 'scan_default_timeout', 'scan_max_concurrent']
+const scannerKeys = ['nmap_path', 'scan_default_timeout', 'scan_max_concurrent']
 const nvdKeys = ['nvd_api_key', 'nvd_api_url', 'nvd_rate_limit_interval']
 
 const dbConfigs = computed(() => configs.value.filter(c => dbKeys.includes(c.key)))

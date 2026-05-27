@@ -1,10 +1,10 @@
 <template>
   <div>
     <el-card>
-      <template #header><span>新建扫描任务</span></template>
+      <template #header><span>新建服务发现任务</span></template>
       <el-form :model="scanForm" :rules="scanRules" ref="scanFormRef" label-width="100px">
         <el-form-item label="任务名称" prop="name">
-          <el-input v-model="scanForm.name" placeholder="输入扫描任务名称" />
+          <el-input v-model="scanForm.name" placeholder="输入任务名称" />
         </el-form-item>
         <el-form-item label="扫描目标" prop="targets">
           <div class="target-input-wrapper">
@@ -61,7 +61,10 @@
         </el-alert>
         <el-form-item label="端口扫描" prop="port_scan_method">
           <el-radio-group v-model="scanForm.port_scan_method">
-            <el-tooltip content="TCP SYN半开扫描，速度快且隐蔽，不完成完整握手，最常用（nmap需root，内置扫描器自动降级为全连接）" placement="top">
+            <el-tooltip content="SYN全端口分块扫描(1-65535)，每块独立保存可恢复，充足重传防丢包漏报，推荐" placement="top">
+              <el-radio-button value="nmap_syn_full">SYN全端口扫描</el-radio-button>
+            </el-tooltip>
+            <el-tooltip content="TCP SYN半开扫描，速度快且隐蔽，不完成完整握手（nmap需root，内置扫描器自动降级为全连接）" placement="top">
               <el-radio-button value="nmap_syn">SYN扫描</el-radio-button>
             </el-tooltip>
             <el-tooltip content="TCP全连接扫描，完成完整三次握手，最可靠，无需root权限" placement="top">
@@ -69,9 +72,6 @@
             </el-tooltip>
             <el-tooltip content="UDP端口扫描，速度慢，用于发现DNS(53)/SNMP(161)等UDP服务" placement="top">
               <el-radio-button value="nmap_udp">UDP扫描</el-radio-button>
-            </el-tooltip>
-            <el-tooltip content="高速端口扫描器，适合大网段快速发现开放端口，但不识别服务" placement="top">
-              <el-radio-button value="nmap_connect">全连接扫描</el-radio-button>
             </el-tooltip>
           </el-radio-group>
         </el-form-item>
@@ -88,16 +88,6 @@
             </el-tooltip>
           </el-checkbox-group>
         </el-form-item>
-        <el-form-item label="主机发现">
-          <el-checkbox-group v-model="scanForm.host_discovery">
-            <el-tooltip content="快速主机存活检测，不扫端口，仅判断IP是否在线" placement="top">
-              <el-checkbox value="nmap_ping">Ping探测</el-checkbox>
-            </el-tooltip>
-            <el-tooltip content="ARP层主机发现，仅限同网段，可发现禁ping的隐藏主机" placement="top">
-              <el-checkbox value="nmap_arp">ARP探测</el-checkbox>
-            </el-tooltip>
-          </el-checkbox-group>
-        </el-form-item>
         <div style="margin:-8px 0 16px 100px;color:#909399;font-size:12px">
           <span>快捷组合：</span>
           <el-link type="primary" :underline="false" @click="applyPreset('syn_svc')">SYN+服务识别</el-link>
@@ -105,8 +95,6 @@
           <el-link type="primary" :underline="false" @click="applyPreset('connect_svc')">全连接+服务识别</el-link>
           <span style="margin:0 8px">|</span>
           <el-link type="primary" :underline="false" @click="applyPreset('full')">全面扫描</el-link>
-          <span style="margin:0 8px">|</span>
-          <el-link type="primary" :underline="false" @click="applyPreset('alive_then_port')">先探测存活再扫端口</el-link>
         </div>
         <el-form-item label="端口范围">
           <el-input v-model="scanForm.ports" placeholder="留空则扫描全端口1-65535，自定义如 22,80,443 或 1-1000" />
@@ -118,7 +106,7 @@
     </el-card>
 
     <el-card style="margin-top:20px">
-      <template #header><span>扫描历史</span></template>
+      <template #header><span>服务发现历史</span></template>
       <el-tabs v-model="historyTab">
         <el-tab-pane label="一次性扫描" name="one_time">
           <el-table :data="oneTimeScans" stripe border>
@@ -161,10 +149,9 @@
             <el-table-column prop="next_run" label="下次执行" width="180">
               <template #default="{ row }">{{ row.next_run ? row.next_run.slice(0,19) : '-' }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="250">
+            <el-table-column label="操作" width="200">
               <template #default="{ row }">
                 <el-button size="small" @click="viewDetail(row)">详情</el-button>
-                <el-button size="small" type="primary" :disabled="row.status==='running'" @click="openEditDialog(row)">编辑</el-button>
                 <el-button v-if="row.is_active" size="small" type="warning" @click="handleDeactivate(row)">停用</el-button>
                 <el-button v-else size="small" type="success" @click="handleActivate(row)">启用</el-button>
               </template>
@@ -174,91 +161,50 @@
       </el-tabs>
     </el-card>
 
-    <el-dialog v-model="detailVisible" title="扫描详情" width="80%">
-      <el-table v-if="scanStore.currentScan" :data="scanStore.results" stripe border>
-        <el-table-column prop="ip" label="IP" width="150" />
-        <el-table-column prop="hostname" label="主机名" width="150" />
-        <el-table-column prop="os" label="操作系统" width="150" />
-        <el-table-column label="开放端口" min-width="200">
-          <template #default="{ row }">
-            <span v-for="p in (row.ports || [])" :key="p.port" style="margin-right:8px">{{ p.port }}/{{ p.service || p.proto }}</span>
-          </template>
-        </el-table-column>
-      </el-table>
-    </el-dialog>
-
-    <el-dialog v-model="editVisible" title="编辑周期扫描任务" width="650px" destroy-on-close>
-      <el-form :model="editForm" :rules="editRules" ref="editFormRef" label-width="100px">
-        <el-form-item label="任务名称" prop="name">
-          <el-input v-model="editForm.name" placeholder="输入扫描任务名称" />
-        </el-form-item>
-        <el-form-item label="扫描目标" prop="targets">
-          <el-input v-model="editForm.targets" type="textarea" :rows="3" placeholder="每行一个目标，支持IP/CIDR/域名" />
-        </el-form-item>
-        <el-form-item label="扫描模式" prop="scan_mode">
-          <el-radio-group v-model="editForm.scan_mode">
-            <el-radio-button value="quick">快速</el-radio-button>
-            <el-radio-button value="standard">标准</el-radio-button>
-            <el-radio-button value="stealth_light">隐蔽-轻度</el-radio-button>
-            <el-radio-button value="stealth_medium">隐蔽-中度</el-radio-button>
-            <el-radio-button value="stealth_deep">隐蔽-深度</el-radio-button>
-            <el-radio-button value="custom">自定义</el-radio-button>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item label="周期间隔" prop="interval_minutes">
-          <el-input-number v-model="editForm.interval_minutes" :min="1" :max="10080" />
-          <span style="margin-left:8px;color:#909399">分钟</span>
-        </el-form-item>
-        <el-form-item label="端口范围">
-          <el-input v-model="editForm.ports" placeholder="如 22,80,443 或 1-1000，留空扫描全端口" />
-        </el-form-item>
-        <el-form-item label="扫描方法" prop="scan_methods">
-          <el-checkbox-group v-model="editForm.scan_methods">
-            <el-checkbox value="nmap_syn">SYN扫描</el-checkbox>
-            <el-checkbox value="nmap_connect">全连接扫描</el-checkbox>
-            <el-checkbox value="nmap_udp">UDP扫描</el-checkbox>
-            <el-checkbox value="nmap_service">服务识别</el-checkbox>
-            <el-checkbox value="nmap_service">服务识别</el-checkbox>
-            <el-checkbox value="nmap_os">OS识别</el-checkbox>
-            <el-checkbox value="nmap_script">脚本扫描</el-checkbox>
-<el-checkbox value="nmap_ping">Ping探测</el-checkbox>
-              <el-checkbox value="nmap_arp">ARP探测</el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="editVisible = false">取消</el-button>
-        <el-button type="primary" :loading="editSubmitting" @click="handleEditSave">保存</el-button>
-      </template>
+    <el-dialog v-model="detailVisible" title="服务发现详情" width="80%">
+      <el-tabs>
+        <el-tab-pane label="扫描结果">
+          <el-table v-if="detailData" :data="detailData.results || []" stripe border>
+            <el-table-column prop="ip" label="IP" width="150" />
+            <el-table-column prop="hostname" label="主机名" width="150" />
+            <el-table-column prop="os" label="操作系统" width="150" />
+            <el-table-column label="开放端口" min-width="200">
+              <template #default="{ row }">
+                <span v-for="p in (row.ports || [])" :key="p.port" style="margin-right:8px">{{ p.port }}/{{ p.service || p.proto }}</span>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="执行日志">
+          <div class="log-container">
+            <div v-if="detailData && detailData.scan_log && detailData.scan_log.length" class="log-lines">
+              <div v-for="(entry, idx) in detailData.scan_log" :key="idx" class="log-line">
+                <span class="log-ts">{{ entry.ts ? entry.ts.slice(11, 19) : '' }}</span>
+                <span class="log-msg">{{ entry.msg }}</span>
+              </div>
+            </div>
+            <div v-else class="log-empty">暂无日志</div>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
     </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { useScanStore } from '../stores/scan'
+import { createServiceScan, getServiceScans, getServiceScanDetail, cancelServiceScan, activateServiceScan, deactivateServiceScan } from '../api/discovery'
 import { getAssetTargets } from '../api/assets'
 import { ElMessage } from 'element-plus'
 
-const scanStore = useScanStore()
 const scanFormRef = ref(null)
 const submitting = ref(false)
 const detailVisible = ref(false)
+const detailData = ref(null)
 const historyTab = ref('one_time')
 const assetTargets = ref([])
 const selectedAssetIds = ref([])
-const editVisible = ref(false)
-const editSubmitting = ref(false)
-const editFormRef = ref(null)
-const editingTaskId = ref(null)
-const editForm = reactive({ name: '', targets: '', scan_mode: 'standard', interval_minutes: 60, ports: '', scan_methods: [] })
-const editRules = {
-  name: [{ required: true, message: '请输入任务名称', trigger: 'blur' }],
-  targets: [{ required: true, message: '请输入扫描目标', trigger: 'blur' }],
-  scan_mode: [{ required: true, message: '请选择扫描模式', trigger: 'change' }],
-  scan_methods: [{ required: true, type: 'array', min: 1, message: '请至少选择一种扫描方法', trigger: 'change' }]
-}
-
+const scans = ref([])
 
 const handleAssetSelect = (selectedIds) => {
   const selectedIps = assetTargets.value
@@ -281,13 +227,13 @@ const fetchAssetTargets = async () => {
   }
 }
 
-const oneTimeScans = computed(() => scanStore.scans.filter(s => s.scan_type === 'one_time'))
-const periodicScans = computed(() => scanStore.scans.filter(s => s.scan_type === 'periodic'))
+const oneTimeScans = computed(() => scans.value.filter(s => s.scan_type === 'one_time'))
+const periodicScans = computed(() => scans.value.filter(s => s.scan_type === 'periodic'))
 
-const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', interval_minutes: 60, scan_mode: 'standard', port_scan_method: 'nmap_syn', service_detect: ['nmap_service'], host_discovery: [], ports: '' })
+const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', interval_minutes: 60, scan_mode: 'standard', port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service'], ports: '' })
 const scanRules = {
   name: [{ required: true, message: '请输入任务名称', trigger: 'blur' }],
-  targets: [{ required: true, message: '请输入扫描目标', trigger: 'blur' }],
+  targets: [{ required: true, message: '请选择扫描目标', trigger: 'change' }],
   scan_mode: [{ required: true, message: '请选择扫描模式', trigger: 'change' }]
 }
 
@@ -297,13 +243,19 @@ const statusLabel = (s) => ({ pending: '等待中', running: '扫描中', comple
 
 const applyPreset = (preset) => {
   const presets = {
-    syn_svc:         { port_scan_method: 'nmap_syn',    service_detect: ['nmap_service'],                       host_discovery: [] },
-    connect_svc:     { port_scan_method: 'nmap_connect', service_detect: ['nmap_service'],                       host_discovery: [] },
-    full:            { port_scan_method: 'nmap_syn',    service_detect: ['nmap_service', 'nmap_os', 'nmap_script'], host_discovery: [] },
-    alive_then_port: { port_scan_method: 'nmap_syn',    service_detect: ['nmap_service'],                       host_discovery: ['nmap_ping'] },
+    syn_svc:     { port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service'] },
+    connect_svc: { port_scan_method: 'nmap_connect', service_detect: ['nmap_service'] },
+    full:        { port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service', 'nmap_os', 'nmap_script'] },
   }
   const p = presets[preset]
   if (p) Object.assign(scanForm, p)
+}
+
+const fetchScans = async () => {
+  try {
+    const res = await getServiceScans()
+    scans.value = res.data.items || res.data
+  } catch (e) { /* ignore */ }
 }
 
 const handleSubmit = async () => {
@@ -315,76 +267,76 @@ const handleSubmit = async () => {
   }
   submitting.value = true
   try {
-    const payload = { ...scanForm, scan_methods: [scanForm.port_scan_method, ...scanForm.service_detect, ...scanForm.host_discovery] }
-    await scanStore.createScan(payload)
+    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, interval_minutes: scanForm.interval_minutes, scan_category: 'service_discovery', scan_methods: [scanForm.port_scan_method, ...scanForm.service_detect], scan_mode: scanForm.scan_mode, ports: scanForm.ports || null }
+    await createServiceScan(payload)
+    ElMessage.success('服务发现任务已创建')
     scanForm.name = ''
     scanForm.targets = ''
     selectedAssetIds.value = []
+    await fetchScans()
   } catch (e) {
     ElMessage.error(e.response?.data?.detail || '创建失败')
   } finally { submitting.value = false }
 }
 
 const viewDetail = async (row) => {
-  await scanStore.fetchScanDetail(row.id)
-  detailVisible.value = true
+  try {
+    const res = await getServiceScanDetail(row.id)
+    detailData.value = res.data
+    detailVisible.value = true
+  } catch (e) { ElMessage.error('获取详情失败') }
 }
 
 const handleCancel = async (row) => {
-  try { await scanStore.cancelScan(row.id) } catch (e) { ElMessage.error('取消失败') }
+  try { await cancelServiceScan(row.id); ElMessage.success('已取消'); await fetchScans() } catch (e) { ElMessage.error('取消失败') }
 }
 
 const handleActivate = async (row) => {
-  try {
-    await import('../api/discovery').then(m => m.activateScan(row.id))
-    ElMessage.success('已启用')
-    scanStore.fetchScans()
-  } catch (e) { ElMessage.error('启用失败') }
+  try { await activateServiceScan(row.id); ElMessage.success('已启用'); await fetchScans() } catch (e) { ElMessage.error('启用失败') }
 }
 
 const handleDeactivate = async (row) => {
-  try {
-    await import('../api/discovery').then(m => m.deactivateScan(row.id))
-    ElMessage.success('已停用')
-    scanStore.fetchScans()
-  } catch (e) { ElMessage.error('停用失败') }
+  try { await deactivateServiceScan(row.id); ElMessage.success('已停用'); await fetchScans() } catch (e) { ElMessage.error('停用失败') }
 }
 
-const openEditDialog = (row) => {
-  editingTaskId.value = row.id
-  editForm.name = row.name || ''
-  editForm.targets = row.targets || ''
-  editForm.scan_mode = row.scan_mode || 'standard'
-  editForm.interval_minutes = row.interval_minutes || 60
-  editForm.ports = row.ports || ''
-  editForm.scan_methods = row.scan_methods || []
-  editVisible.value = true
-}
-
-const handleEditSave = async () => {
-  const valid = await editFormRef.value.validate().catch(() => false)
-  if (!valid) return
-  editSubmitting.value = true
-  try {
-    await scanStore.updateScan(editingTaskId.value, {
-      name: editForm.name,
-      targets: editForm.targets,
-      scan_mode: editForm.scan_mode,
-      interval_minutes: editForm.interval_minutes,
-      ports: editForm.ports || null,
-      scan_methods: editForm.scan_methods
-    })
-    editVisible.value = false
-  } catch (e) {
-    ElMessage.error(e.response?.data?.detail || '更新失败')
-  } finally { editSubmitting.value = false }
-}
-
-onMounted(() => { scanStore.fetchScans(); fetchAssetTargets() })
+onMounted(() => { fetchScans(); fetchAssetTargets() })
 </script>
 
 <style scoped>
 .target-input-wrapper {
   width: 100%;
+}
+.log-container {
+  max-height: 400px;
+  overflow-y: auto;
+  background: #1e1e1e;
+  border-radius: 4px;
+  padding: 12px;
+  font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+  font-size: 13px;
+}
+.log-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.log-line {
+  display: flex;
+  gap: 12px;
+  line-height: 1.6;
+}
+.log-ts {
+  color: #6a9955;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.log-msg {
+  color: #d4d4d4;
+  word-break: break-all;
+}
+.log-empty {
+  color: #6a9955;
+  text-align: center;
+  padding: 20px;
 }
 </style>

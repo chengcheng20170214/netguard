@@ -4,6 +4,7 @@
     <el-card style="margin-top:16px">
       <el-descriptions :column="3" border>
         <el-descriptions-item label="IP">{{ asset.ip }}</el-descriptions-item>
+        <el-descriptions-item label="指纹">{{ asset.fingerprint ? asset.fingerprint.slice(0, 16) + '...' : '-' }}</el-descriptions-item>
         <el-descriptions-item label="MAC">{{ asset.mac || '-' }}</el-descriptions-item>
         <el-descriptions-item label="主机名">{{ asset.hostname || '-' }}</el-descriptions-item>
         <el-descriptions-item label="操作系统">{{ asset.os || '-' }}</el-descriptions-item>
@@ -20,6 +21,12 @@
           <el-table-column prop="proto" label="协议" width="100" />
           <el-table-column prop="service" label="服务" width="150" />
           <el-table-column prop="version" label="版本" />
+          <el-table-column label="分类" width="120">
+            <template #default="{ row }">{{ row.category || '其他' }}</template>
+          </el-table-column>
+          <el-table-column label="风险" width="100">
+            <template #default="{ row }"><el-tag :type="row.risk==='critical'?'danger':row.risk==='high'?'warning':row.risk==='medium'?'info':'success'" size="small">{{ row.risk || 'low' }}</el-tag></template>
+          </el-table-column>
         </el-table>
       </el-tab-pane>
       <el-tab-pane label="变更历史">
@@ -59,9 +66,9 @@ const vulns = ref([])
 
 const goBack = () => { router.push('/assets') }
 
-const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更', mac_changed: 'MAC变更', hostname_changed: '主机名变更' }[t] || t)
-const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info', mac_changed: 'info', hostname_changed: 'info' }[t] || 'info')
-const changeColor = (t) => ({ new_host: '#67C23A', host_down: '#F56C6C', new_service: '#409EFF', service_closed: '#E6A23C', version_changed: '#E6A23C', mac_changed: '#909399', hostname_changed: '#909399' }[t] || '#909399')
+const changeTypeLabel = (t) => ({ new_host: '新增主机', host_down: '主机下线', new_service: '新增服务', service_closed: '服务关闭', version_changed: '版本变更', os_changed: 'OS变更', mac_changed: 'MAC变更', hostname_changed: '主机名变更', ip_changed: 'IP变更' }[t] || t)
+const changeTypeColor = (t) => ({ new_host: 'success', host_down: 'danger', new_service: '', service_closed: 'warning', version_changed: 'warning', os_changed: 'info', mac_changed: 'info', hostname_changed: 'info', ip_changed: 'warning' }[t] || 'info')
+const changeColor = (t) => ({ new_host: '#67C23A', host_down: '#F56C6C', new_service: '#409EFF', service_closed: '#E6A23C', version_changed: '#E6A23C', mac_changed: '#909399', hostname_changed: '#909399', ip_changed: '#E6A23C' }[t] || '#909399')
 
 const formatChangeDetail = (c) => {
   const d = c.detail || {}
@@ -72,6 +79,7 @@ const formatChangeDetail = (c) => {
     case 'os_changed': return `${d.old || '?'} → ${d.new || '?'}`
     case 'hostname_changed': return `${d.old || '?'} → ${d.new || '?'}`
     case 'mac_changed': return `${d.old || '?'} → ${d.new || '?'}`
+    case 'ip_changed': return `${d.old || '?'} → ${d.new || '?'}`
     case 'new_host': return '新发现主机'
     case 'host_down': return '主机下线'
     default: return JSON.stringify(d)
