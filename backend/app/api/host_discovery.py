@@ -66,7 +66,7 @@ async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db),
         name=req.name, targets=req.targets, scan_category=ScanCategory.host_discovery,
         scan_type=req.scan_type, scan_mode=req.scan_mode,
         scan_methods=["nmap_ping", "nmap_arp", "nmap_syn"],
-        ports=req.ports, interval_minutes=req.interval_minutes,
+        ports=req.ports, max_concurrent=req.max_concurrent, interval_minutes=req.interval_minutes,
         created_by=current_user.id, next_run=next_run,
         is_active=True
     )
@@ -128,6 +128,8 @@ async def update_host_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSessio
         task.scan_methods = [m.value for m in req.scan_methods]
     if req.ports is not None:
         task.ports = req.ports
+    if req.max_concurrent is not None:
+        task.max_concurrent = req.max_concurrent
     if req.interval_minutes is not None:
         task.interval_minutes = req.interval_minutes
         if task.scan_type == ScanType.periodic and task.is_active:

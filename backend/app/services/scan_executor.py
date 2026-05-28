@@ -127,6 +127,7 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
                 scan_targets, ports,
                 scan_method=method, scan_mode=scan_mode,
                 progress_callback=progress_cb,
+                max_concurrent=scan_task.max_concurrent or 4,
             )
             prev_count = len(all_results)
             _merge_results(all_results, scan_results)

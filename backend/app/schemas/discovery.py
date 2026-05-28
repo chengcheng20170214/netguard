@@ -33,6 +33,14 @@ class ScanRequest(BaseModel):
     scan_mode: ScanMode = ScanMode.standard
     scan_methods: list[ScanMethod] = ["nmap_syn_full", "nmap_service"]
     ports: str | None = None
+    max_concurrent: int = 4
+
+    @field_validator("max_concurrent")
+    @classmethod
+    def validate_max_concurrent(cls, v: int) -> int:
+        if v < 1 or v > 8:
+            raise ValueError("并发数必须在 1-8 之间")
+        return v
     interval_minutes: int | None = None
 
     @field_validator("targets")
@@ -58,6 +66,7 @@ class ScanUpdateRequest(BaseModel):
     scan_mode: ScanMode | None = None
     scan_methods: list[ScanMethod] | None = None
     ports: str | None = None
+    max_concurrent: int | None = None
     interval_minutes: int | None = None
 
     @field_validator("targets")
@@ -96,6 +105,7 @@ class ScanTaskResponse(BaseModel):
     scan_mode: ScanMode
     scan_methods: list | None = None
     ports: str | None = None
+    max_concurrent: int = 4
     interval_minutes: int | None = None
     is_active: bool = True
     status: ScanStatus = ScanStatus.pending

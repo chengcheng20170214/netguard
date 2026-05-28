@@ -62,7 +62,7 @@ async def create_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), curr
         name=req.name, targets=req.targets, scan_type=req.scan_type,
         scan_mode=req.scan_mode,
         scan_methods=[m.value for m in req.scan_methods],
-        ports=req.ports, interval_minutes=req.interval_minutes,
+        ports=req.ports, max_concurrent=req.max_concurrent, interval_minutes=req.interval_minutes,
         created_by=current_user.id, next_run=next_run,
         is_active=True
     )

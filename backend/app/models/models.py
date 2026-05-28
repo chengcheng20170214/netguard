@@ -78,6 +78,7 @@ class ScanTask(Base):
     scan_mode = Column(Enum(ScanMode), default=ScanMode.standard, nullable=False)
     scan_methods = Column(JSON, default=list)
     ports = Column(String(200), default=None)
+    max_concurrent = Column(Integer, default=4)
     interval_minutes = Column(Integer, default=None)
     is_active = Column(Boolean, default=True)
     status = Column(Enum(ScanStatus), default=ScanStatus.pending, nullable=False)

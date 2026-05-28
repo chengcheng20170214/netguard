@@ -99,6 +99,10 @@
         <el-form-item label="端口范围">
           <el-input v-model="scanForm.ports" placeholder="留空则扫描全端口1-65535，自定义如 22,80,443 或 1-1000" />
         </el-form-item>
+        <el-form-item label="并发数">
+          <el-slider v-model="scanForm.max_concurrent" :min="1" :max="8" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8(最大)' }" style="width:300px" />
+          <span style="margin-left:12px;color:#909399;font-size:12px">同时运行的 nmap 进程数，越大越快但更占资源</span>
+        </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="submitting" @click="handleSubmit">开始扫描</el-button>
         </el-form-item>
@@ -303,7 +307,7 @@ const fetchAssetTargets = async () => {
 const oneTimeScans = computed(() => scans.value.filter(s => s.scan_type === 'one_time'))
 const periodicScans = computed(() => scans.value.filter(s => s.scan_type === 'periodic'))
 
-const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', interval_minutes: 60, scan_mode: 'standard', port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service'], ports: '' })
+const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', max_concurrent: 4, interval_minutes: 60, scan_mode: 'standard', port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service'], ports: '' })
 const scanRules = {
   name: [{ required: true, message: '请输入任务名称', trigger: 'blur' }],
   targets: [{ required: true, message: '请选择扫描目标', trigger: 'change' }],
@@ -358,7 +362,7 @@ const handleSubmit = async () => {
   }
   submitting.value = true
   try {
-    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, interval_minutes: scanForm.interval_minutes, scan_category: 'service_discovery', scan_methods: [scanForm.port_scan_method, ...scanForm.service_detect], scan_mode: scanForm.scan_mode, ports: scanForm.ports || null }
+    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'service_discovery', scan_methods: [scanForm.port_scan_method, ...scanForm.service_detect], scan_mode: scanForm.scan_mode, ports: scanForm.ports || null }
     await createServiceScan(payload)
     ElMessage.success('服务发现任务已创建')
     scanForm.name = ''

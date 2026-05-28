@@ -38,6 +38,10 @@
         <el-form-item label="发现方法">
           <el-text type="info">自动执行 Ping探测 → ARP探测 → SYN端口扫描 三阶段递进扫描，确保无遗漏</el-text>
         </el-form-item>
+        <el-form-item label="并发数">
+          <el-slider v-model="scanForm.max_concurrent" :min="1" :max="8" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8(最大)' }" style="width:300px" />
+          <span style="margin-left:12px;color:#909399;font-size:12px">同时运行的 nmap 进程数，越大越快但更占资源</span>
+        </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="submitting" @click="handleSubmit">开始发现</el-button>
         </el-form-item>
@@ -251,7 +255,7 @@ const clearTargets = () => {
 const oneTimeScans = computed(() => scans.value.filter(s => s.scan_type === 'one_time'))
 const periodicScans = computed(() => scans.value.filter(s => s.scan_type === 'periodic'))
 
-const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', interval_minutes: 60 })
+const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', max_concurrent: 4, interval_minutes: 60 })
 const scanRules = {
   name: [{ required: true, message: '请输入任务名称', trigger: 'blur' }],
   targets: [{ required: true, message: '请输入扫描目标', trigger: 'blur' }]
@@ -295,7 +299,7 @@ const handleSubmit = async () => {
   }
   submitting.value = true
   try {
-    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery', scan_methods: ['nmap_ping', 'nmap_arp', 'nmap_syn'], scan_mode: 'standard' }
+    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery', scan_methods: ['nmap_ping', 'nmap_arp', 'nmap_syn'], scan_mode: 'standard' }
     await createHostScan(payload)
     ElMessage.success('主机发现任务已创建')
     scanForm.name = ''

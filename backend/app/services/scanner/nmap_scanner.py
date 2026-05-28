@@ -118,13 +118,14 @@ class NmapScanner(BaseScanner):
         scan_method = kwargs.get("scan_method", "nmap_syn")
         scan_mode = kwargs.get("scan_mode", "standard")
         progress_callback = kwargs.get("progress_callback")
+        max_concurrent = kwargs.get("max_concurrent", settings.SCAN_MAX_CONCURRENT)
 
         if scan_method == "nmap_syn_full":
-            return await self._scan_full_port_chunked(targets, ports, scan_mode, **kwargs)
+            return await self._scan_full_port_chunked(targets, ports, scan_mode, max_concurrent=max_concurrent, **kwargs)
 
         # 耗时扫描（非 ping/arp）使用子进程 + 实时进度 + 网段并发
         if progress_callback and scan_method not in ("nmap_ping", "nmap_arp"):
-            return await self._scan_with_progress(targets, scan_method, scan_mode, ports, progress_callback)
+            return await self._scan_with_progress(targets, scan_method, scan_mode, ports, progress_callback, max_concurrent)
 
         args = self._build_args(scan_method, scan_mode, ports)
         loop = asyncio.get_event_loop()
@@ -133,11 +134,11 @@ class NmapScanner(BaseScanner):
 
     async def _scan_with_progress(
         self, targets: str, scan_method: str, scan_mode: str,
-        ports: str | None, progress_callback
+        ports: str | None, progress_callback, max_concurrent: int = 4
     ) -> list[dict]:
         """按网段并发执行 nmap 子进程，实时输出进度，完成后解析 XML 结果。"""
         target_list = _split_targets(targets)
-        max_concurrent = settings.SCAN_MAX_CONCURRENT
+        max_concurrent = min(max(1, max_concurrent), 8)
         semaphore = asyncio.Semaphore(max_concurrent)
 
         if len(target_list) > 1:
@@ -280,10 +281,10 @@ class NmapScanner(BaseScanner):
 
         return results
 
-    async def _scan_full_port_chunked(self, targets: str, ports: str | None, scan_mode: str, **kwargs) -> list[dict]:
+    async def _scan_full_port_chunked(self, targets: str, ports: str | None, scan_mode: str, max_concurrent: int = 4, **kwargs) -> list[dict]:
         """全端口分块扫描，按网段并发 + 端口块并发。"""
         target_list = _split_targets(targets)
-        max_concurrent = settings.SCAN_MAX_CONCURRENT
+        max_concurrent = min(max(1, max_concurrent), 8)
         semaphore = asyncio.Semaphore(max_concurrent)
         chunk_size = kwargs.get("chunk_size", settings.SCAN_CHUNK_SIZE)
         base_args = _build_full_port_args(scan_mode)
