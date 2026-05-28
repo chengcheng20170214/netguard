@@ -110,16 +110,12 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
 
             scanner = scanner_cls()
 
-            if method == "nmap_syn" and all_results:
-                alive_hosts = " ".join(all_results.keys())
-                scan_targets = alive_hosts
-                await _append_log(db, scan_task, f"阶段 {i+1}/{total}: {step_label} 开始 (仅针对已发现的 {len(all_results)} 个存活主机)")
-            else:
-                scan_targets = targets
-                await _append_log(db, scan_task, f"阶段 {i+1}/{total}: {step_label} 开始")
+            # 所有阶段独立扫描全目标，不依赖前序阶段结果
+            scan_targets = targets
+            await _append_log(db, scan_task, f"阶段 {i+1}/{total}: {step_label} 开始")
 
             await _append_log(db, scan_task, f"正在执行 {step_label} (方法: {method}, 目标: {scan_targets})...")
-            scan_results = await scanner.scan(scan_targets, ports, scan_method=method, scan_mode=effective_scan_mode if method == "nmap_syn" else scan_mode)
+            scan_results = await scanner.scan(scan_targets, ports, scan_method=method, scan_mode=scan_mode)
             prev_count = len(all_results)
             _merge_results(all_results, scan_results)
 
