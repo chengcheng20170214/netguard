@@ -96,18 +96,16 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
     progressive_methods = list(HOST_DISCOVERY_PIPELINE)
     total = len(progressive_methods)
     errors = []
-    pipeline_logs = []
 
     await _append_log(db, scan_task, f"开始主机发现扫描, 目标: {targets}, 模式: {scan_mode}")
 
     for i, method in enumerate(progressive_methods):
         step_label = ["Ping探测", "ARP探测", "SYN端口扫描"][i] if i < 3 else method
-        pipeline_logs.append(f"阶段 {i+1}/{total}: {step_label} 开始")
 
         try:
             scanner_cls = SCANNER_REGISTRY.get(method)
             if not scanner_cls:
-                pipeline_logs.append(f"跳过未注册方法: {method}")
+                await _append_log(db, scan_task, f"跳过未注册方法: {method}")
                 continue
 
             scanner = scanner_cls()
@@ -115,13 +113,13 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
             if method == "nmap_syn" and all_results:
                 alive_hosts = " ".join(all_results.keys())
                 scan_targets = alive_hosts
-                pipeline_logs.append(f"SYN扫描仅针对已发现的 {len(all_results)} 个存活主机")
+                await _append_log(db, scan_task, f"阶段 {i+1}/{total}: {step_label} 开始 (仅针对已发现的 {len(all_results)} 个存活主机)")
             else:
                 scan_targets = targets
+                await _append_log(db, scan_task, f"阶段 {i+1}/{total}: {step_label} 开始")
 
-            effective_scan_mode = "quick" if method == "nmap_syn" else scan_mode
-            pipeline_logs.append(f"正在执行 {step_label} (方法: {method}, 目标: {scan_targets})...")
-            scan_results = await scanner.scan(scan_targets, ports, scan_method=method, scan_mode=effective_scan_mode)
+            await _append_log(db, scan_task, f"正在执行 {step_label} (方法: {method}, 目标: {scan_targets})...")
+            scan_results = await scanner.scan(scan_targets, ports, scan_method=method, scan_mode=effective_scan_mode if method == "nmap_syn" else scan_mode)
             prev_count = len(all_results)
             _merge_results(all_results, scan_results)
 
@@ -134,15 +132,15 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
                         new_results_data.append(persisted)
 
             new_count = len(all_results) - prev_count
-            pipeline_logs.append(f"{step_label}完成, 新发现 {new_count} 个主机, 累计 {len(all_results)} 个")
+            await _append_log(db, scan_task, f"{step_label}完成, 新发现 {new_count} 个主机, 累计 {len(all_results)} 个")
 
         except Exception as e:
             logger.warning(f"Host discovery method {method} failed for task {scan_task_id}: {e}")
             errors.append(f"{method}: {e}")
-            pipeline_logs.append(f"{step_label}失败: {e}")
+            await _append_log(db, scan_task, f"{step_label}失败: {e}")
 
         progress = int((i + 1) / total * 100)
-        yield progress, errors, pipeline_logs, new_results_data
+        yield progress, errors, new_results_data
 
 
 async def run_chunked_full_scan(
@@ -448,24 +446,19 @@ async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id
             is_host_discovery = cat is not None and (cat.value if hasattr(cat, 'value') else str(cat)) == 'host_discovery'
 
             if is_host_discovery:
-                async for progress, errors, pipeline_logs, new_results in run_host_discovery(
+                async for progress, errors, new_results in run_host_discovery(
                     scan_task.targets, scan_task.scan_mode.value if hasattr(scan_task.scan_mode, 'value') else scan_task.scan_mode,
                     scan_task.ports, scan_task_id, all_results, db, scan_task
                 ):
                     scan_task.progress = progress
                     all_errors = errors
-                    now = datetime.now(timezone.utc).isoformat()
-                    new_entries = [{"ts": now, "msg": msg} for msg in pipeline_logs]
-                    scan_task.scan_log = list(scan_task.scan_log or []) + new_entries
-                    pipeline_logs.clear()
-                    from sqlalchemy.orm.attributes import flag_modified
-                    flag_modified(scan_task, "scan_log")
 
                     scan_task.result_summary = {
                         "total_hosts": len(all_results),
                         "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
                         "new_results": new_results,
                     }
+                    from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(scan_task, "result_summary")
                     await db.commit()
                     if progress_callback:
