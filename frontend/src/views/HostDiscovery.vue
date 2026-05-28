@@ -67,6 +67,9 @@
               <template #default="{ row }">{{ row.result_summary?.total_hosts ?? '-' }}</template>
             </el-table-column>
             <el-table-column prop="created_at" label="创建时间" width="180" />
+            <el-table-column label="耗时" width="100">
+              <template #default="{ row }">{{ scanDuration(row) }}</template>
+            </el-table-column>
             <el-table-column label="操作" width="260" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" @click="viewDetail(row)">详情</el-button>
@@ -93,6 +96,9 @@
             </el-table-column>
             <el-table-column prop="next_run" label="下次执行" width="180">
               <template #default="{ row }">{{ row.next_run ? row.next_run.slice(0,19) : '-' }}</template>
+            </el-table-column>
+            <el-table-column label="耗时" width="100">
+              <template #default="{ row }">{{ scanDuration(row) }}</template>
             </el-table-column>
             <el-table-column label="操作" width="280" fixed="right">
               <template #default="{ row }">
@@ -263,6 +269,18 @@ const scanRules = {
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info')
 const statusLabel = (s) => ({ pending: '等待中', running: '扫描中', completed: '已完成', failed: '失败', cancelled: '已取消' }[s] || s)
+const scanDuration = (row) => {
+  if (!row.started_at) return '-'
+  const start = new Date(row.started_at)
+  const end = row.completed_at ? new Date(row.completed_at) : (row.status === 'running' ? new Date() : null)
+  if (!end) return '-'
+  const sec = Math.round((end - start) / 1000)
+  if (sec < 60) return sec + '秒'
+  const m = Math.floor(sec / 60), s = sec % 60
+  if (m < 60) return m + '分' + s + '秒'
+  const h = Math.floor(m / 60), rm = m % 60
+  return h + '时' + rm + '分'
+}
 
 const hasRunningScans = computed(() => scans.value.some(s => s.status === 'running'))
 
