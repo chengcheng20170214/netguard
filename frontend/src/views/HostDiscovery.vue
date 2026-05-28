@@ -36,7 +36,7 @@
           <span style="margin-left:8px;color:#909399">分钟</span>
         </el-form-item>
         <el-form-item label="发现方法">
-          <el-text type="info">自动执行 Ping探测 → ARP探测 → SYN端口扫描 三阶段递进扫描，确保无遗漏</el-text>
+          <el-text type="info">自动执行 Ping探测 → ARP探测 → TCP端口扫描，端口扫描阶段按端口块并行</el-text>
         </el-form-item>
         <el-form-item label="并发数">
           <el-slider v-model="scanForm.max_concurrent" :min="1" :max="8" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8(最大)' }" style="width:300px" />
@@ -209,15 +209,30 @@ const CIDR_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/
 const RANGE_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}-\d{1,3}$/
 const HOSTNAME_RE = /^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$/
 
+const isValidIP = (ip) => {
+  const parts = ip.split('.').map(Number)
+  return parts.length === 4 && parts.every(p => p >= 0 && p <= 255)
+}
+
 const detectTargetType = (val) => {
-  if (CIDR_RE.test(val)) return { type: 'cidr', typeLabel: 'CIDR', valid: true }
-  if (IP_RE.test(val)) {
-    const parts = val.split('.').map(Number)
-    if (parts.every(p => p >= 0 && p <= 255)) return { type: 'ip', typeLabel: 'IP', valid: true }
-    return { type: 'invalid', typeLabel: '无效', valid: false }
+  if (CIDR_RE.test(val)) {
+    const [ip, mask] = val.split('/')
+    const maskNum = parseInt(mask)
+    if (isValidIP(ip) && maskNum >= 8 && maskNum <= 32) return { type: 'cidr', typeLabel: 'CIDR', valid: true }
+    return { type: 'invalid', typeLabel: '无效CIDR', valid: false }
   }
-  if (RANGE_RE.test(val)) return { type: 'range', typeLabel: 'IP范围', valid: true }
-  if (HOSTNAME_RE.test(val) && !val.includes('..')) return { type: 'hostname', typeLabel: '域名', valid: true }
+  if (IP_RE.test(val)) {
+    if (isValidIP(val)) return { type: 'ip', typeLabel: 'IP', valid: true }
+    return { type: 'invalid', typeLabel: '无效IP', valid: false }
+  }
+  if (RANGE_RE.test(val)) {
+    const [ip, tail] = val.split('-')
+    const tailNum = parseInt(tail)
+    if (isValidIP(ip) && tailNum >= 0 && tailNum <= 255) return { type: 'range', typeLabel: 'IP范围', valid: true }
+    return { type: 'invalid', typeLabel: '无效范围', valid: false }
+  }
+  if (HOSTNAME_RE.test(val) && !val.includes('..') && val.includes('.')) return { type: 'hostname', typeLabel: '域名', valid: true }
+  if (HOSTNAME_RE.test(val) && !val.includes('..') && !val.includes('.')) return { type: 'invalid', typeLabel: '需包含域名后缀', valid: false }
   return { type: 'invalid', typeLabel: '无效', valid: false }
 }
 
@@ -234,7 +249,7 @@ const addTarget = () => {
   if (!val) return
   const info = detectTargetType(val)
   if (!info.valid) {
-    ElMessage.warning(`无效的扫描目标: ${val}`)
+    ElMessage.warning(`无效的扫描目标: ${val} (${info.typeLabel})`)
     return
   }
   const existing = (scanForm.targets || '').split('\n').map(l => l.trim()).filter(Boolean)

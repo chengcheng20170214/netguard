@@ -37,12 +37,7 @@ class ScanStatus(str, enum.Enum):
 
 
 class ScanMode(str, enum.Enum):
-    quick = "quick"
     standard = "standard"
-    stealth_light = "stealth_light"
-    stealth_medium = "stealth_medium"
-    stealth_deep = "stealth_deep"
-    custom = "custom"
 
 
 class ScanType(str, enum.Enum):
