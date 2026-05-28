@@ -1,11 +1,18 @@
 
 import asyncio
 import ipaddress
+import logging
+import os
 import re
 import shlex
+import tempfile
+import time
+
 import nmap
 from .base import BaseScanner
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def validate_targets(targets: str) -> str:
@@ -28,6 +35,11 @@ def validate_targets(targets: str) -> str:
     return " ".join(validated)
 
 
+def _split_targets(targets: str) -> list[str]:
+    """将目标拆分为独立网段/主机列表。"""
+    return [t.strip() for t in targets.split() if t.strip()]
+
+
 STEALTH_PROFILES = {
     "stealth_light": {"timing": "-T2", "scan_delay": "400ms", "max_rate": "50", "extra": []},
     "stealth_medium": {"timing": "-T1", "scan_delay": "3s", "max_rate": "10", "extra": ["-f", "--randomize-hosts"]},
@@ -46,7 +58,6 @@ METHOD_ARGS = {
     "nmap_syn_full": ["-sS"],
 }
 
-# nmap stdout 中值得实时回调的进度行关键词
 _PROGRESS_PATTERNS = re.compile(
     r"(Discovered open port|Completed|Scanning|Timing:|Nmap scan report|Note: Host seems down)"
 )
@@ -76,6 +87,31 @@ def _build_full_port_args(scan_mode: str) -> str:
     return " ".join(parts)
 
 
+def _merge_results(all_results: dict, new_results: list[dict]):
+    """合并扫描结果，同 IP 的端口去重。"""
+    for r in new_results:
+        ip = r.get("ip")
+        if not ip:
+            continue
+        if ip in all_results:
+            existing = all_results[ip]
+            if r.get("ports"):
+                ep = {f"{p['port']}/{p.get('proto', 'tcp')}": p for p in (existing.get("ports") or [])}
+                for p in r["ports"]:
+                    key = f"{p['port']}/{p.get('proto', 'tcp')}"
+                    if key not in ep:
+                        existing.setdefault("ports", []).append(p)
+                        ep[key] = p
+            if r.get("os") and not existing.get("os"):
+                existing["os"] = r["os"]
+            if r.get("hostname") and not existing.get("hostname"):
+                existing["hostname"] = r["hostname"]
+            if r.get("mac") and not existing.get("mac"):
+                existing["mac"] = r["mac"]
+        else:
+            all_results[ip] = r
+
+
 class NmapScanner(BaseScanner):
     async def scan(self, targets: str, ports: str | None = None, **kwargs) -> list[dict]:
         targets = validate_targets(targets)
@@ -86,7 +122,7 @@ class NmapScanner(BaseScanner):
         if scan_method == "nmap_syn_full":
             return await self._scan_full_port_chunked(targets, ports, scan_mode, **kwargs)
 
-        # 耗时扫描（非 ping/arp）使用子进程 + 实时进度输出
+        # 耗时扫描（非 ping/arp）使用子进程 + 实时进度 + 网段并发
         if progress_callback and scan_method not in ("nmap_ping", "nmap_arp"):
             return await self._scan_with_progress(targets, scan_method, scan_mode, ports, progress_callback)
 
@@ -99,74 +135,105 @@ class NmapScanner(BaseScanner):
         self, targets: str, scan_method: str, scan_mode: str,
         ports: str | None, progress_callback
     ) -> list[dict]:
-        """用子进程执行 nmap，实时读取 stdout 输出进度，完成后用 python-nmap 解析 XML 结果。"""
-        args = self._build_args(scan_method, scan_mode, ports)
-        nmap_path = settings.NMAP_PATH
-        cmd = [nmap_path] + shlex.split(args) + targets.split()
+        """按网段并发执行 nmap 子进程，实时输出进度，完成后解析 XML 结果。"""
+        target_list = _split_targets(targets)
+        max_concurrent = settings.SCAN_MAX_CONCURRENT
+        semaphore = asyncio.Semaphore(max_concurrent)
 
-        # 添加 -oX 让 nmap 输出 XML 到临时文件，供后续解析
-        import tempfile, os
-        xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_")
-        os.close(xml_fd)
-        cmd.extend(["-oX", xml_path])
+        if len(target_list) > 1:
+            await progress_callback(f"检测到 {len(target_list)} 个网段, 最大并发 {max_concurrent} 个 nmap 进程")
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        all_results = {}
+        completed = 0
+        total = len(target_list)
 
-            # 实时读取 stdout，匹配进度行
-            last_progress_time = 0
-            host_count = 0
-            port_count = 0
-            if proc.stdout:
-                while True:
-                    line = await proc.stdout.readline()
-                    if not line:
-                        break
-                    line_str = line.decode("utf-8", errors="replace").strip()
-                    if not line_str:
-                        continue
+        async def _scan_one_segment(segment: str):
+            nonlocal completed
+            async with semaphore:
+                args = self._build_args(scan_method, scan_mode, ports)
+                nmap_path = settings.NMAP_PATH
+                cmd = [nmap_path] + shlex.split(args) + [segment]
 
-                    # 统计已发现主机
-                    if line_str.startswith("Nmap scan report for ") or line_str.startswith("Nmap scan report for\t"):
-                        host_count += 1
+                xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_")
+                os.close(xml_fd)
+                cmd.extend(["-oX", xml_path])
 
-                    # 统计已发现开放端口
-                    if line_str.startswith("Discovered open port"):
-                        port_count += 1
+                try:
+                    timeout_sec = settings.SCAN_HOST_DISCOVERY_TIMEOUT * 60
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
 
-                    # 匹配进度关键词，限频回调（至少间隔 2 秒）
-                    if _PROGRESS_PATTERNS.search(line_str):
-                        import time
-                        now = time.time()
-                        if now - last_progress_time >= 2:
-                            msg = line_str
-                            if host_count > 0 or port_count > 0:
-                                msg = f"{line_str} (已发现 {host_count} 主机, {port_count} 开放端口)"
-                            await progress_callback(msg)
-                            last_progress_time = now
+                    last_progress_time = 0
+                    host_count = 0
+                    port_count = 0
 
-            await proc.wait()
+                    try:
+                        if proc.stdout:
+                            while True:
+                                try:
+                                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+                                except asyncio.TimeoutError:
+                                    # 30秒无输出，发心跳日志
+                                    await progress_callback(f"[{segment}] 扫描进行中... (已发现 {host_count} 主机, {port_count} 开放端口)")
+                                    continue
+                                if not line:
+                                    break
+                                line_str = line.decode("utf-8", errors="replace").strip()
+                                if not line_str:
+                                    continue
 
-            # 解析 XML 结果
-            results = self._parse_xml_results(xml_path)
-            # 最终回调：扫描完成汇总
-            await progress_callback(
-                f"nmap 子进程退出 (code={proc.returncode}), 共发现 {len(results)} 个存活主机, {sum(len(r.get('ports', [])) for r in results)} 个开放端口"
-            )
-            return results
+                                if line_str.startswith("Nmap scan report for ") or line_str.startswith("Nmap scan report for\t"):
+                                    host_count += 1
+                                if line_str.startswith("Discovered open port"):
+                                    port_count += 1
 
-        except Exception as e:
-            raise RuntimeError(f"nmap 子进程执行失败: {e}")
-        finally:
-            if os.path.exists(xml_path):
-                os.unlink(xml_path)
+                                if _PROGRESS_PATTERNS.search(line_str):
+                                    now = time.time()
+                                    if now - last_progress_time >= 2:
+                                        msg = f"[{segment}] {line_str}"
+                                        if host_count > 0 or port_count > 0:
+                                            msg = f"[{segment}] {line_str} (已发现 {host_count} 主机, {port_count} 开放端口)"
+                                        await progress_callback(msg)
+                                        last_progress_time = now
+
+                        await asyncio.wait_for(proc.wait(), timeout=timeout_sec)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                        await progress_callback(f"[{segment}] 扫描超时 ({settings.SCAN_HOST_DISCOVERY_TIMEOUT}分钟), 已终止")
+
+                    results = self._parse_xml_results(xml_path)
+                    completed += 1
+                    await progress_callback(
+                        f"[{segment}] 完成 ({completed}/{total}), 发现 {len(results)} 个存活主机"
+                    )
+                    _merge_results(all_results, results)
+
+                except Exception as e:
+                    completed += 1
+                    await progress_callback(f"[{segment}] 扫描失败: {e}")
+                finally:
+                    if os.path.exists(xml_path):
+                        os.unlink(xml_path)
+
+        # 并发启动所有网段扫描
+        tasks = [_scan_one_segment(seg) for seg in target_list]
+        await asyncio.gather(*tasks)
+
+        total_hosts = len(all_results)
+        total_ports = sum(len(r.get("ports", [])) for r in all_results.values())
+        await progress_callback(
+            f"全部网段扫描完成, 共发现 {total_hosts} 个存活主机, {total_ports} 个开放端口"
+        )
+        return list(all_results.values())
 
     def _parse_xml_results(self, xml_path: str) -> list[dict]:
         """用 python-nmap 解析 XML 文件，返回标准结果列表。"""
+        if not os.path.exists(xml_path):
+            return []
         nm = nmap.PortScanner()
         try:
             with open(xml_path, "r", errors="replace") as f:
@@ -214,8 +281,14 @@ class NmapScanner(BaseScanner):
         return results
 
     async def _scan_full_port_chunked(self, targets: str, ports: str | None, scan_mode: str, **kwargs) -> list[dict]:
+        """全端口分块扫描，按网段并发 + 端口块并发。"""
+        target_list = _split_targets(targets)
+        max_concurrent = settings.SCAN_MAX_CONCURRENT
+        semaphore = asyncio.Semaphore(max_concurrent)
         chunk_size = kwargs.get("chunk_size", settings.SCAN_CHUNK_SIZE)
         base_args = _build_full_port_args(scan_mode)
+        on_chunk_done = kwargs.get("on_chunk_done")
+        progress_callback = kwargs.get("progress_callback")
 
         chunk_ranges = []
         start = 1
@@ -224,42 +297,73 @@ class NmapScanner(BaseScanner):
             chunk_ranges.append((start, end))
             start = end + 1
 
-        on_chunk_done = kwargs.get("on_chunk_done")
+        if progress_callback:
+            await progress_callback(
+                f"全端口扫描: {len(target_list)} 网段 × {len(chunk_ranges)} 端口块, 最大并发 {max_concurrent}"
+            )
 
         all_results = {}
-        for i, (port_start, port_end) in enumerate(chunk_ranges):
-            port_spec = f"{port_start}-{port_end}"
-            args = f"{base_args} -p{port_spec}"
+        total_tasks = len(target_list) * len(chunk_ranges)
+        completed_tasks = 0
 
-            try:
-                loop = asyncio.get_event_loop()
-                chunk_results = await loop.run_in_executor(None, self._run_nmap, targets, args)
-                for r in chunk_results:
-                    ip = r.get("ip")
-                    if ip in all_results:
-                        existing = all_results[ip]
-                        if r.get("ports"):
-                            ep = {f"{p['port']}/{p.get('proto', 'tcp')}": p for p in (existing.get("ports") or [])}
-                            for p in r["ports"]:
-                                key = f"{p['port']}/{p.get('proto', 'tcp')}"
-                                if key not in ep:
-                                    existing.setdefault("ports", []).append(p)
-                                    ep[key] = p
-                        if r.get("os") and not existing.get("os"):
-                            existing["os"] = r["os"]
-                        if r.get("hostname") and not existing.get("hostname"):
-                            existing["hostname"] = r["hostname"]
-                        if r.get("mac") and not existing.get("mac"):
-                            existing["mac"] = r["mac"]
-                    else:
-                        all_results[ip] = r
-            except Exception:
-                if on_chunk_done:
-                    on_chunk_done(i, port_start, port_end, success=False)
-                continue
+        async def _scan_chunk(segment: str, port_start: int, port_end: int, chunk_idx: int):
+            nonlocal completed_tasks
+            async with semaphore:
+                port_spec = f"{port_start}-{port_end}"
+                args = f"{base_args} -p{port_spec}"
 
-            if on_chunk_done:
-                on_chunk_done(i, port_start, port_end, success=True)
+                xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_chunk_")
+                os.close(xml_fd)
+
+                try:
+                    nmap_path = settings.NMAP_PATH
+                    cmd = [nmap_path] + shlex.split(args) + [segment, "-oX", xml_path]
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    timeout_sec = settings.SCAN_HOST_DISCOVERY_TIMEOUT * 60
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=timeout_sec)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+
+                    chunk_results = self._parse_xml_results(xml_path)
+                    _merge_results(all_results, chunk_results)
+                    completed_tasks += 1
+
+                    if progress_callback and completed_tasks % 5 == 0:
+                        await progress_callback(
+                            f"全端口扫描进度: {completed_tasks}/{total_tasks} 块完成"
+                        )
+
+                    if on_chunk_done:
+                        on_chunk_done(chunk_idx, port_start, port_end, success=True)
+
+                except Exception:
+                    completed_tasks += 1
+                    if on_chunk_done:
+                        on_chunk_done(chunk_idx, port_start, port_end, success=False)
+                finally:
+                    if os.path.exists(xml_path):
+                        os.unlink(xml_path)
+
+        # 构建所有扫描任务
+        tasks = []
+        for segment in target_list:
+            for i, (port_start, port_end) in enumerate(chunk_ranges):
+                tasks.append(_scan_chunk(segment, port_start, port_end, i))
+
+        await asyncio.gather(*tasks)
+
+        if progress_callback:
+            total_hosts = len(all_results)
+            total_ports = sum(len(r.get("ports", [])) for r in all_results.values())
+            await progress_callback(
+                f"全端口扫描完成: {total_hosts} 主机, {total_ports} 开放端口"
+            )
 
         return list(all_results.values())
 

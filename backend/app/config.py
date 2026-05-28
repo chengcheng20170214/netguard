@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     SCAN_HOST_TIMEOUT_MIN: int = int(os.getenv("SCAN_HOST_TIMEOUT_MIN", "60"))  # 单主机超时(分钟)
     SCAN_CHUNK_MAX_RETRIES: int = int(os.getenv("SCAN_CHUNK_MAX_RETRIES", "3"))  # 失败块最大重试次数
 
+    # 并发控制
+    SCAN_MAX_CONCURRENT: int = int(os.getenv("SCAN_MAX_CONCURRENT", "4"))  # 最大并发 nmap 进程数
+    SCAN_HOST_DISCOVERY_TIMEOUT: int = int(os.getenv("SCAN_HOST_DISCOVERY_TIMEOUT", "30"))  # 主机发现单阶段超时(分钟)
+
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
 
