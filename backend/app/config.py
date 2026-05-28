@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
     APP_NAME: str = "NetGuard"
-    APP_VERSION: str = "1.0.0"
+    APP_VERSION: str = "1.1.0"
     DEBUG: bool = False
 
     # Database
