@@ -52,7 +52,7 @@ METHOD_ARGS = {
 }
 
 _PROGRESS_PATTERNS = re.compile(
-    r"(Discovered open port|Completed|Scanning|Timing:|Nmap scan report|Note: Host seems down)"
+    r"(Discovered open port|Completed|Scanning|Timing:|Nmap scan report|Note: Host seems down|Connect scan|hosts up|ports/host)"
 )
 
 # 端口分块大小：每块 5000 端口，65535/5000 ≈ 14 块
@@ -198,7 +198,7 @@ class NmapScanner(BaseScanner):
                 cmd = [nmap_path] + shlex.split(args) + target_list
 
                 # 带重试的执行
-                for attempt in range(1, max_retries + 2):  # 首次 + max_retries次重试
+                for attempt in range(1, max_retries + 2):
                     xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_p_")
                     os.close(xml_fd)
                     cmd_with_xml = cmd + ["-oX", xml_path]
@@ -212,6 +212,7 @@ class NmapScanner(BaseScanner):
                         )
 
                         last_progress_time = 0.0
+                        last_output_time = time.time()
                         chunk_port_count = 0
                         success = False
 
@@ -219,11 +220,15 @@ class NmapScanner(BaseScanner):
                             if proc.stdout:
                                 while True:
                                     try:
-                                        line = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
+                                        line = await asyncio.wait_for(proc.stdout.readline(), timeout=10)
                                     except asyncio.TimeoutError:
+                                        # 10秒无输出 → 心跳
+                                        now = time.time()
+                                        since_output = int(now - last_output_time)
                                         await progress_callback(
-                                            f"[端口 {port_spec}] 扫描进行中... (全局: {global_host_count} 主机, {global_port_count} 开放端口)"
+                                            f"[端口 {port_spec}] 扫描进行中... 已等待{since_output}秒 (全局: {global_host_count} 主机, {global_port_count} 开放端口)"
                                         )
+                                        last_progress_time = now
                                         continue
                                     if not line:
                                         break
@@ -231,15 +236,20 @@ class NmapScanner(BaseScanner):
                                     if not line_str:
                                         continue
 
+                                    # 任何输出都更新最后输出时间
+                                    last_output_time = time.time()
+
+                                    # 统计主机和端口
                                     if line_str.startswith("Nmap scan report for ") or line_str.startswith("Nmap scan report for\t"):
                                         global_host_count += 1
                                     if line_str.startswith("Discovered open port"):
                                         chunk_port_count += 1
                                         global_port_count += 1
 
+                                    # 匹配进度行 → 1秒节流输出
                                     if _PROGRESS_PATTERNS.search(line_str):
                                         now = time.time()
-                                        if now - last_progress_time >= 3:
+                                        if now - last_progress_time >= 1:
                                             await progress_callback(
                                                 f"[端口 {port_spec}] {line_str} (全局: {global_host_count} 主机, {global_port_count} 开放端口)"
                                             )
