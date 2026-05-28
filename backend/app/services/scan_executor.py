@@ -98,6 +98,8 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
     errors = []
     pipeline_logs = []
 
+    await _append_log(db, scan_task, f"开始主机发现扫描, 目标: {targets}, 模式: {scan_mode}")
+
     for i, method in enumerate(progressive_methods):
         step_label = ["Ping探测", "ARP探测", "SYN端口扫描"][i] if i < 3 else method
         pipeline_logs.append(f"阶段 {i+1}/{total}: {step_label} 开始")
@@ -118,6 +120,7 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
                 scan_targets = targets
 
             effective_scan_mode = "quick" if method == "nmap_syn" else scan_mode
+            pipeline_logs.append(f"正在执行 {step_label} (方法: {method}, 目标: {scan_targets})...")
             scan_results = await scanner.scan(scan_targets, ports, scan_method=method, scan_mode=effective_scan_mode)
             prev_count = len(all_results)
             _merge_results(all_results, scan_results)
@@ -251,10 +254,15 @@ async def run_scan_methods(targets: str, scan_mode: str, scan_methods: list, por
     other_methods = [m for m in scan_methods if m != "nmap_syn_full"]
 
     if has_full_scan:
+        if db and scan_task:
+            await _append_log(db, scan_task, "开始全端口分块扫描 (SYN Full)")
         async for progress, errors, new_results in run_chunked_full_scan(
             targets, scan_mode, scan_task_id, all_results, db, scan_task
         ):
             yield progress, errors, new_results
+
+    if other_methods and db and scan_task:
+        await _append_log(db, scan_task, f"开始执行其他扫描方法: {', '.join(other_methods)}")
 
     total = len(other_methods)
     errors = []
@@ -463,6 +471,7 @@ async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id
                     if progress_callback:
                         progress_callback(progress)
             else:
+                await _append_log(db, scan_task, f"开始服务发现扫描, 目标: {scan_task.targets}, 模式: {scan_task.scan_mode.value if hasattr(scan_task.scan_mode, 'value') else scan_task.scan_mode}")
                 async for progress, errors, new_results in run_scan_methods(
                     scan_task.targets, scan_task.scan_mode.value if hasattr(scan_task.scan_mode, 'value') else scan_task.scan_mode,
                     scan_methods, scan_task.ports, scan_task_id, all_results,

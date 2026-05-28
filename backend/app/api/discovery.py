@@ -206,6 +206,99 @@ async def deactivate_periodic_scan(scan_id: int, db: AsyncSession = Depends(get_
     return {"message": "周期扫描已停用"}
 
 
+@router.delete("/{scan_id}")
+async def delete_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Delete a scan task and its results."""
+    result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="扫描任务不存在")
+    if task.status == ScanStatus.running:
+        raise HTTPException(status_code=400, detail="运行中的任务不可删除，请先取消")
+
+    if task.scan_type == ScanType.periodic and task.is_active:
+        try:
+            from app.services.scheduler import scheduler_service
+            scheduler_service.remove_periodic_scan(task.id)
+        except Exception as e:
+            logger.warning(f"Failed to remove periodic scan {task.id} from scheduler: {e}")
+
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(ScanResult).where(ScanResult.scan_task_id == scan_id))
+    from app.models.models import ScanChunk
+    await db.execute(sa_delete(ScanChunk).where(ScanChunk.scan_task_id == scan_id))
+    await db.delete(task)
+    await db.commit()
+    return {"message": "扫描任务已删除"}
+
+
+@router.post("/{scan_id}/rescan", response_model=ScanTaskResponse)
+async def rescan_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Re-run a scan task with the same configuration."""
+    result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="扫描任务不存在")
+    if task.status == ScanStatus.running:
+        raise HTTPException(status_code=400, detail="任务正在运行中，请等待完成后再重新扫描")
+
+    task.status = ScanStatus.pending
+    task.progress = 0
+    task.error_message = None
+    task.scan_log = []
+    task.result_summary = {}
+    task.celery_task_id = None
+    task.started_at = None
+    task.completed_at = None
+    task.last_run = datetime.now(timezone.utc)
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(task, "scan_log")
+    flag_modified(task, "result_summary")
+    await db.commit()
+    await db.refresh(task)
+
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(ScanResult).where(ScanResult.scan_task_id == scan_id))
+    from app.models.models import ScanChunk
+    await db.execute(sa_delete(ScanChunk).where(ScanChunk.scan_task_id == scan_id))
+    await db.commit()
+    await db.refresh(task)
+
+    # Dispatch scan directly without reconstructing ScanRequest
+    # (avoids ScanMethod enum validation errors for legacy data)
+    import asyncio
+    dispatched = False
+    try:
+        from app.tasks.scan_tasks import run_scan_task
+        scan_mode_val = task.scan_mode.value if hasattr(task.scan_mode, 'value') else str(task.scan_mode)
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                run_scan_task.delay,
+                task.id, task.targets, scan_mode_val,
+                task.scan_methods or [], task.ports
+            ),
+            timeout=3.0
+        )
+        dispatched = True
+    except Exception as e:
+        logger.error(f"Failed to dispatch rescan via Celery: {e}")
+
+    if not dispatched:
+        from app.services.scan_executor import execute_scan
+        task_handle = asyncio.create_task(execute_scan(task.id))
+        task_handle.add_done_callback(lambda t: logger.error(f"Rescan task {task.id} failed: {t.exception()}") if t.exception() else None)
+
+    if task.scan_type == ScanType.periodic and task.is_active and task.interval_minutes:
+        try:
+            from app.services.scheduler import scheduler_service
+            scheduler_service.add_periodic_scan(task.id, task.interval_minutes)
+        except Exception as e:
+            logger.error(f"Failed to register periodic rescan: {e}")
+
+    await db.refresh(task)
+    return task
+
+
 @router.websocket("/ws/scan/{task_id}")
 async def scan_ws(websocket: WebSocket, task_id: int, token: str = Query(default="")):
     if not token:

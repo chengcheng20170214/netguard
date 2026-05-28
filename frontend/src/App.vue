@@ -2,7 +2,10 @@
   <div class="app-container" v-if="token">
     <el-container>
       <el-aside width="220px" class="app-sidebar">
-        <div class="logo">NetGuard</div>
+        <div class="logo">
+          <div class="logo-name">NetGuard</div>
+          <div class="logo-version">v{{ appVersion }}</div>
+        </div>
         <el-menu :default-active="$route.path" router background-color="#1d1e2c" text-color="#bfcbd9" active-text-color="#409eff">
           <el-menu-item index="/">
             <el-icon><Monitor /></el-icon>
@@ -52,13 +55,26 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useAuthStore } from './stores/auth'
 import { Monitor, Search, Files, Warning, User, Setting, Connection } from '@element-plus/icons-vue'
+import api from './api/index'
 
 const authStore = useAuthStore()
 const token = computed(() => authStore.token)
 const user = computed(() => authStore.user)
+const appVersion = ref('...')
+
+const fetchVersion = async () => {
+  try {
+    const res = await api.get('/health')
+    appVersion.value = res.data.version || '—'
+  } catch (e) {
+    appVersion.value = '—'
+  }
+}
+
+onMounted(() => { fetchVersion() })
 
 const roleLabel = computed(() => {
   const map = { admin: '管理员', auditor: '审计员', guest: '访客' }

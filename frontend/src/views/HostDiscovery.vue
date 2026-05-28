@@ -55,13 +55,21 @@
               <template #default="{ row }"><el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag></template>
             </el-table-column>
             <el-table-column label="进度" width="200">
-              <template #default="{ row }"><el-progress :percentage="row.progress || 0" /></template>
+              <template #default="{ row }">
+                <el-progress :percentage="row.progress || 0" :status="row.status === 'failed' ? 'exception' : (row.status === 'completed' ? 'success' : '')" />
+              </template>
+            </el-table-column>
+            <el-table-column label="发现主机" width="100">
+              <template #default="{ row }">{{ row.result_summary?.total_hosts ?? '-' }}</template>
             </el-table-column>
             <el-table-column prop="created_at" label="创建时间" width="180" />
-            <el-table-column label="操作" width="150">
+            <el-table-column label="操作" width="260" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" @click="viewDetail(row)">详情</el-button>
                 <el-button v-if="row.status==='running'" size="small" type="danger" @click="handleCancel(row)">取消</el-button>
+                <el-button v-if="row.status!=='running'" size="small" type="primary" @click="handleRescan(row)">重新扫描</el-button>
+                <el-button v-if="row.status!=='running'" size="small" type="warning" @click="handleEdit(row)">编辑</el-button>
+                <el-button v-if="row.status!=='running'" size="small" type="danger" @click="handleDelete(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -82,11 +90,14 @@
             <el-table-column prop="next_run" label="下次执行" width="180">
               <template #default="{ row }">{{ row.next_run ? row.next_run.slice(0,19) : '-' }}</template>
             </el-table-column>
-            <el-table-column label="操作" width="200">
+            <el-table-column label="操作" width="280" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" @click="viewDetail(row)">详情</el-button>
+                <el-button v-if="row.status!=='running'" size="small" type="primary" @click="handleRescan(row)">重新扫描</el-button>
                 <el-button v-if="row.is_active" size="small" type="warning" @click="handleDeactivate(row)">停用</el-button>
                 <el-button v-else size="small" type="success" @click="handleActivate(row)">启用</el-button>
+                <el-button v-if="row.status!=='running'" size="small" type="warning" @click="handleEdit(row)">编辑</el-button>
+                <el-button v-if="row.status!=='running'" size="small" type="danger" @click="handleDelete(row)">删除</el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -94,25 +105,66 @@
       </el-tabs>
     </el-card>
 
+    <!-- Edit Dialog -->
+    <el-dialog v-model="editVisible" title="编辑主机发现任务" width="600px">
+      <el-form :model="editForm" label-width="100px">
+        <el-form-item label="任务名称">
+          <el-input v-model="editForm.name" />
+        </el-form-item>
+        <el-form-item label="扫描目标">
+          <el-input v-model="editForm.targets" type="textarea" :rows="3" placeholder="每行一个目标" />
+        </el-form-item>
+        <el-form-item v-if="editForm.scan_type === 'periodic'" label="扫描间隔">
+          <el-input-number v-model="editForm.interval_minutes" :min="1" :max="10080" />
+          <span style="margin-left:8px;color:#909399">分钟</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="editVisible = false">取消</el-button>
+        <el-button type="primary" :loading="editSubmitting" @click="submitEdit">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- Detail Dialog -->
     <el-dialog v-model="detailVisible" title="主机发现详情" width="80%">
-      <el-tabs>
-        <el-tab-pane label="扫描结果">
+      <el-tabs v-model="detailTab">
+        <el-tab-pane label="扫描结果" name="result">
+          <div v-if="detailData && detailData.status === 'running'" style="margin-bottom:12px">
+            <el-progress :percentage="detailData.progress || 0" :stroke-width="18" :text-inside="true" status="" />
+            <span style="margin-left:8px;color:#909399;font-size:12px">扫描进行中...</span>
+          </div>
           <el-table v-if="detailData" :data="detailData.results || []" stripe border>
             <el-table-column prop="ip" label="IP" width="150" />
             <el-table-column prop="mac" label="MAC地址" width="180" />
             <el-table-column prop="hostname" label="主机名" width="200" />
           </el-table>
+          <div v-if="detailData && !detailData.results?.length" style="text-align:center;color:#909399;padding:20px">暂无扫描结果</div>
         </el-tab-pane>
-        <el-tab-pane label="执行日志">
-          <div class="log-container">
+        <el-tab-pane label="执行日志" name="log">
+          <div class="log-container" ref="logContainerRef">
             <div v-if="detailData && detailData.scan_log && detailData.scan_log.length" class="log-lines">
               <div v-for="(entry, idx) in detailData.scan_log" :key="idx" class="log-line">
                 <span class="log-ts">{{ entry.ts ? entry.ts.slice(11, 19) : '' }}</span>
-                <span class="log-msg">{{ entry.msg }}</span>
+                <span :class="['log-msg', entry.msg && entry.msg.includes('失败') ? 'log-error' : '']">{{ entry.msg }}</span>
               </div>
             </div>
             <div v-else class="log-empty">暂无日志</div>
           </div>
+        </el-tab-pane>
+        <el-tab-pane label="扫描概要" name="summary" v-if="detailData">
+          <el-descriptions :column="2" border>
+            <el-descriptions-item label="任务名称">{{ detailData.name }}</el-descriptions-item>
+            <el-descriptions-item label="扫描目标">{{ detailData.targets }}</el-descriptions-item>
+            <el-descriptions-item label="状态"><el-tag :type="statusType(detailData.status)" size="small">{{ statusLabel(detailData.status) }}</el-tag></el-descriptions-item>
+            <el-descriptions-item label="进度">{{ detailData.progress || 0 }}%</el-descriptions-item>
+            <el-descriptions-item label="发现主机数">{{ detailData.result_summary?.total_hosts ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="发现端口数">{{ detailData.result_summary?.total_ports ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="创建时间">{{ detailData.created_at }}</el-descriptions-item>
+            <el-descriptions-item label="完成时间">{{ detailData.completed_at || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="错误信息" :span="2" v-if="detailData.error_message">
+              <span style="color:#F56C6C">{{ detailData.error_message }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
         </el-tab-pane>
       </el-tabs>
     </el-dialog>
@@ -120,17 +172,27 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
-import { createHostScan, getHostScans, getHostScanDetail, cancelHostScan, activateHostScan, deactivateHostScan } from '../api/discovery'
-import { ElMessage } from 'element-plus'
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { createHostScan, getHostScans, getHostScanDetail, cancelHostScan, activateHostScan, deactivateHostScan, updateHostScan, deleteHostScan, rescanHostScan } from '../api/discovery'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const scanFormRef = ref(null)
 const submitting = ref(false)
 const detailVisible = ref(false)
 const detailData = ref(null)
+const detailTab = ref('result')
 const historyTab = ref('one_time')
 const targetInput = ref('')
 const scans = ref([])
+const logContainerRef = ref(null)
+
+// Edit dialog state
+const editVisible = ref(false)
+const editSubmitting = ref(false)
+const editForm = reactive({ id: null, name: '', targets: '', scan_type: '', interval_minutes: 60 })
+
+// Auto-refresh timer for running tasks
+let refreshTimer = null
 
 const IP_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const CIDR_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$/
@@ -198,11 +260,29 @@ const scanRules = {
 const statusType = (s) => ({ pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info')
 const statusLabel = (s) => ({ pending: '等待中', running: '扫描中', completed: '已完成', failed: '失败', cancelled: '已取消' }[s] || s)
 
+const hasRunningScans = computed(() => scans.value.some(s => s.status === 'running'))
+
 const fetchScans = async () => {
   try {
     const res = await getHostScans()
     scans.value = res.data.items || res.data
   } catch (e) { /* ignore */ }
+}
+
+const startAutoRefresh = () => {
+  stopAutoRefresh()
+  if (hasRunningScans.value) {
+    refreshTimer = setInterval(() => {
+      fetchScans()
+    }, 3000)
+  }
+}
+
+const stopAutoRefresh = () => {
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
 }
 
 const handleSubmit = async () => {
@@ -222,6 +302,7 @@ const handleSubmit = async () => {
     scanForm.targets = ''
     targetInput.value = ''
     await fetchScans()
+    startAutoRefresh()
   } catch (e) {
     ElMessage.error(e.response?.data?.detail || '创建失败')
   } finally { submitting.value = false }
@@ -231,8 +312,42 @@ const viewDetail = async (row) => {
   try {
     const res = await getHostScanDetail(row.id)
     detailData.value = res.data
+    detailTab.value = 'result'
     detailVisible.value = true
+
+    // If running, start polling for detail updates
+    if (row.status === 'running') {
+      startDetailPolling(row.id)
+    }
   } catch (e) { ElMessage.error('获取详情失败') }
+}
+
+let detailPollingTimer = null
+const startDetailPolling = (taskId) => {
+  stopDetailPolling()
+  detailPollingTimer = setInterval(async () => {
+    try {
+      const res = await getHostScanDetail(taskId)
+      detailData.value = res.data
+      // Auto-scroll log to bottom
+      await nextTick()
+      if (logContainerRef.value) {
+        logContainerRef.value.scrollTop = logContainerRef.value.scrollHeight
+      }
+      // Stop polling when done
+      if (res.data.status !== 'running') {
+        stopDetailPolling()
+        await fetchScans()
+      }
+    } catch (e) { /* ignore */ }
+  }, 2000)
+}
+
+const stopDetailPolling = () => {
+  if (detailPollingTimer) {
+    clearInterval(detailPollingTimer)
+    detailPollingTimer = null
+  }
 }
 
 const handleCancel = async (row) => {
@@ -247,7 +362,75 @@ const handleDeactivate = async (row) => {
   try { await deactivateHostScan(row.id); ElMessage.success('已停用'); await fetchScans() } catch (e) { ElMessage.error('停用失败') }
 }
 
-onMounted(() => { fetchScans() })
+const handleRescan = async (row) => {
+  try {
+    await ElMessageBox.confirm('确定要使用相同配置重新扫描吗？', '重新扫描', { type: 'info' })
+    await rescanHostScan(row.id)
+    ElMessage.success('已重新发起扫描')
+    await fetchScans()
+    startAutoRefresh()
+  } catch (e) {
+    if (e !== 'cancel') {
+      ElMessage.error(e.response?.data?.detail || '重新扫描失败')
+    }
+  }
+}
+
+const handleEdit = (row) => {
+  editForm.id = row.id
+  editForm.name = row.name
+  editForm.targets = row.targets
+  editForm.scan_type = row.scan_type
+  editForm.interval_minutes = row.interval_minutes || 60
+  editVisible.value = true
+}
+
+const submitEdit = async () => {
+  if (!editForm.name.trim()) {
+    ElMessage.warning('请输入任务名称')
+    return
+  }
+  if (!editForm.targets.trim()) {
+    ElMessage.warning('请输入扫描目标')
+    return
+  }
+  editSubmitting.value = true
+  try {
+    await updateHostScan(editForm.id, {
+      name: editForm.name,
+      targets: editForm.targets,
+      interval_minutes: editForm.scan_type === 'periodic' ? editForm.interval_minutes : null
+    })
+    ElMessage.success('任务已更新')
+    editVisible.value = false
+    await fetchScans()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '更新失败')
+  } finally { editSubmitting.value = false }
+}
+
+const handleDelete = async (row) => {
+  try {
+    await ElMessageBox.confirm('确定要删除此扫描任务吗？删除后不可恢复。', '删除确认', { type: 'warning' })
+    await deleteHostScan(row.id)
+    ElMessage.success('任务已删除')
+    await fetchScans()
+  } catch (e) {
+    if (e !== 'cancel') {
+      ElMessage.error(e.response?.data?.detail || '删除失败')
+    }
+  }
+}
+
+onMounted(() => {
+  fetchScans()
+  startAutoRefresh()
+})
+
+onUnmounted(() => {
+  stopAutoRefresh()
+  stopDetailPolling()
+})
 </script>
 
 <style scoped>
@@ -291,6 +474,9 @@ onMounted(() => { fetchScans() })
 .log-msg {
   color: #d4d4d4;
   word-break: break-all;
+}
+.log-error {
+  color: #f56c6c;
 }
 .log-empty {
   color: #6a9955;
