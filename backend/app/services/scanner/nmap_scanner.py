@@ -392,6 +392,8 @@ class NmapScanner(BaseScanner):
                     parts.extend(["-p", "1-65535"])
             if ports:
                 parts.extend(["-p", ports])
+            # 进度输出参数：-v 输出 Discovered open port / Nmap scan report 等中间行
+            parts.extend(["-v", "--reason"])
         else:
             if scan_mode == "quick":
                 parts.extend(["-T4", "--top-ports", "100"])
