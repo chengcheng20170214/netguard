@@ -102,7 +102,9 @@ do_install() {
     mkdir -p "$REDIS_DIR"
     local tmpdir=$(mktemp -d)
     cd "$tmpdir"
-    apt download redis-server redis-tools liblzf1 2>/dev/null || \n      apt-get download redis-server redis-tools liblzf1 2>/dev/null || \n      warn "apt download 失败，请手动安装 Redis"
+    apt download redis-server redis-tools liblzf1 2>/dev/null || 
+      apt-get download redis-server redis-tools liblzf1 2>/dev/null || 
+      warn "apt download 失败，请手动安装 Redis"
     for deb in *.deb; do
       [ -f "$deb" ] && dpkg-deb -x "$deb" "$REDIS_DIR"
     done
@@ -168,7 +170,7 @@ do_start() {
     if [ ! -x "$REDIS_DIR/usr/bin/redis-server" ]; then
       error "Redis 未安装，运行 $0 install"
     fi
-    LD_LIBRARY_PATH="$REDIS_DIR/usr/lib/x86_64-linux-gnu" \n      "$REDIS_DIR/usr/bin/redis-server" \n      --port 6379 --dir /tmp --daemonize yes
+    LD_LIBRARY_PATH="$REDIS_DIR/usr/lib/x86_64-linux-gnu" "$REDIS_DIR/usr/bin/redis-server" --port 6379 --dir /tmp --daemonize yes
     sleep 1
     if [ "$(check_port 6379)" = "used" ]; then
       info "Redis 启动成功"
@@ -182,7 +184,9 @@ do_start() {
     info "后端已运行"
   else
     info "启动后端..."
-    nohup .venv/bin/uvicorn app.main:app \n      --host 127.0.0.1 --port 8000 \n      > "$LOG_DIR/netguard-uvicorn.log" 2>&1 &
+    nohup .venv/bin/uvicorn app.main:app 
+      --host 127.0.0.1 --port 8000 
+      > "$LOG_DIR/netguard-uvicorn.log" 2>&1 &
     if wait_for "http://127.0.0.1:8000/api/health" "ok" 15; then
       info "后端启动成功"
     else
@@ -195,7 +199,8 @@ do_start() {
     info "Celery 已运行"
   else
     info "启动 Celery Worker..."
-    nohup .venv/bin/celery -A app.tasks.celery_app worker --loglevel=info \n      > "$LOG_DIR/netguard-celery.log" 2>&1 &
+    nohup .venv/bin/celery -A app.tasks.celery_app worker --loglevel=info 
+      > "$LOG_DIR/netguard-celery.log" 2>&1 &
     sleep 3
     if pgrep -f "celery -A app.tasks" &>/dev/null; then
       info "Celery 启动成功"
@@ -216,7 +221,8 @@ do_start() {
   else
     info "启动前端..."
     cd "$FRONTEND_DIR"
-    nohup npx vite --host 127.0.0.1 \n      > "$LOG_DIR/netguard-frontend.log" 2>&1 &
+    nohup npx vite --host 127.0.0.1 
+      > "$LOG_DIR/netguard-frontend.log" 2>&1 &
     if wait_for "http://127.0.0.1:5173/" "" 15; then
       info "前端启动成功"
     else
@@ -250,7 +256,8 @@ do_stop() {
 
   # Redis
   if [ "$(check_port 6379)" = "used" ]; then
-    redis-cli -p 6379 shutdown nosave 2>/dev/null && info "Redis 已停止" || \n      pkill -f "redis-server.*6379" 2>/dev/null && info "Redis 已停止"
+    redis-cli -p 6379 shutdown nosave 2>/dev/null && info "Redis 已停止" || 
+      pkill -f "redis-server.*6379" 2>/dev/null && info "Redis 已停止"
   else
     warn "Redis 未运行"
   fi
