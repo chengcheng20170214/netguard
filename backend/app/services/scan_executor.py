@@ -115,7 +115,19 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
             await _append_log(db, scan_task, f"阶段 {i+1}/{total}: {step_label} 开始")
 
             await _append_log(db, scan_task, f"正在执行 {step_label} (方法: {method}, 目标: {scan_targets})...")
-            scan_results = await scanner.scan(scan_targets, ports, scan_method=method, scan_mode=scan_mode)
+
+            # 耗时扫描传入进度回调，实时输出扫描进展
+            async def _make_progress_cb(scan_task_ref, db_ref):
+                async def cb(msg: str):
+                    await _append_log(db_ref, scan_task_ref, msg)
+                return cb
+            progress_cb = await _make_progress_cb(scan_task, db)
+
+            scan_results = await scanner.scan(
+                scan_targets, ports,
+                scan_method=method, scan_mode=scan_mode,
+                progress_callback=progress_cb,
+            )
             prev_count = len(all_results)
             _merge_results(all_results, scan_results)
 
