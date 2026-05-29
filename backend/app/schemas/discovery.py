@@ -38,8 +38,8 @@ class ScanRequest(BaseModel):
     @field_validator("max_concurrent")
     @classmethod
     def validate_max_concurrent(cls, v: int) -> int:
-        if v < 1 or v > 8:
-            raise ValueError("并发数必须在 1-8 之间")
+        if v < 1 or v > 16:
+            raise ValueError("并发数必须在 1-16 之间")
         return v
     interval_minutes: int | None = None
 
@@ -68,6 +68,13 @@ class ScanUpdateRequest(BaseModel):
     ports: str | None = None
     max_concurrent: int | None = None
     interval_minutes: int | None = None
+
+    @field_validator("max_concurrent")
+    @classmethod
+    def validate_max_concurrent(cls, v: int | None) -> int | None:
+        if v is not None and (v < 1 or v > 16):
+            raise ValueError("并发数必须在 1-16 之间")
+        return v
 
     @field_validator("targets")
     @classmethod

@@ -142,6 +142,8 @@ class NmapScanner(BaseScanner):
         scan_mode = kwargs.get("scan_mode", "standard")
         progress_callback = kwargs.get("progress_callback")
         max_concurrent = kwargs.get("max_concurrent", settings.SCAN_MAX_CONCURRENT)
+        # 外部全局信号量：用于逐IP策略中跨IP共享 nmap 进程并发配额
+        _global_semaphore = kwargs.get("_global_semaphore")
 
         # Ping/ARP：简单快速扫描，用线程池
         if scan_method in ("nmap_ping", "nmap_arp"):
@@ -159,7 +161,7 @@ class NmapScanner(BaseScanner):
 
         # 主机发现阶段3：TCP端口扫描，按端口块并发
         if progress_callback:
-            return await self._scan_port_chunked(targets, progress_callback, max_concurrent)
+            return await self._scan_port_chunked(targets, progress_callback, max_concurrent, _global_semaphore)
 
         # 无进度回调的回退
         args = _build_tcp_scan_args(ports)
@@ -176,13 +178,16 @@ class NmapScanner(BaseScanner):
     ) -> int:
         """根据系统资源动态计算安全并发上限。
 
-        nmap -sT 实际 fd 消耗:
-        - nmap 内部用 poll/select 调度并发连接，同时活跃连接数 ≈ min_rate × avg_rtt
-        - 局域网 RTT <1ms + min_rate=300 → 峰值约 300 个并发 socket
-        - 每个目标主机还有 1 个 fd 用于调度，加上 nmap 内部 fd
-        - 实测: 扫描 500 主机 × 5000 端口块，nmap 峰值 fd 约 500-800
+        nmap -sT 实际 fd 消耗（实测校准）:
+        - nmap 内部用 poll/select 调度并发连接，fd 被复用而非每连接独占
+        - 实测: 单个 nmap -sT 进程扫描 1~500 主机 × 5000 端口块，
+          峰值 fd 约为 50~100，与目标主机数弱相关（poll/select 复用）
+        - 每进程额外开销: stdout/stderr pipe + 临时文件 + 内部调度 ≈ 20 fd
+        - 因此: est_fds_per_proc ≈ 100（常数，覆盖最差情况）
 
-        因此按保守估算: 每进程 fd = min(800, target_hosts + 300)
+        校准记录:
+        - fd_limit=1024, 100主机: 旧模型 est=400→safe_fd=1; 新模型 est=100→safe_fd=7
+        - fd_limit=65535: safe_fd 充裕，由 CPU 和端口约束接管
         """
         import multiprocessing
 
@@ -201,14 +206,13 @@ class NmapScanner(BaseScanner):
         except Exception:
             pass
 
-        # 实际估算: nmap 同时活跃连接 ≈ min_rate * RTT，约 300 个 socket
-        # 加上每个目标主机的调度开销 + nmap 内部 fd
-        est_fds_per_proc = min(800, target_hosts + 300)
+        # 基于实测: nmap -sT 使用 poll/select 复用 fd，单进程峰值约 50-100
+        # 附加 20 fd 用于 pipe/临时文件/内部调度，总计 ~120
+        est_fds_per_proc = 120
 
         safe_by_fd = max(1, (fd_limit - 256) // est_fds_per_proc)
         safe_by_cpu = max(1, cpu_count)
-        # 临时端口: 每个并发连接占用 1 个源端口，nmap 复用已关闭的端口
-        # 保守: 每进程峰值 300 连接，复用源端口
+        # 临时端口: nmap 复用已关闭的源端口，峰值连接约 300，共享源端口池
         safe_by_port = max(1, local_ports // 300)
 
         effective = min(user_concurrent, safe_by_fd, safe_by_cpu, safe_by_port, 16)
@@ -221,7 +225,8 @@ class NmapScanner(BaseScanner):
     # ----------------------------------------------------------------
 
     async def _scan_port_chunked(
-        self, targets: str, progress_callback, max_concurrent: int = 4
+        self, targets: str, progress_callback, max_concurrent: int = 4,
+        _global_semaphore: asyncio.Semaphore | None = None,
     ) -> list[dict]:
         """全端口TCP扫描：按端口块并发，失败自动重试。
 
@@ -229,6 +234,11 @@ class NmapScanner(BaseScanner):
         - 同步线程通过 queue.Queue 发送进度消息（线程安全，无需事件循环）
         - 异步消费者在主事件循环中读取队列并调用 progress_callback（DB 安全）
         - 彻底解决 Celery prefork 下 asyncio.to_thread 的事件循环问题
+
+        Args:
+            _global_semaphore: 外部全局信号量，用于逐IP策略中多个IP共享
+                nmap 进程并发配额。如果提供，则不再创建内部信号量，
+                直接使用全局信号量控制端口块级并发。
         """
         target_list = _split_targets(targets)
         port_chunks = _build_port_chunks()
@@ -325,7 +335,9 @@ class NmapScanner(BaseScanner):
             msg_queue.put(None)  # worker 结束信号
 
         # 启动所有扫描任务（不 await，让它们在后台跑）
-        semaphore = asyncio.Semaphore(max_concurrent)
+        # 如果提供了全局信号量（逐IP策略），使用全局信号量控制跨IP并发；
+        # 否则创建内部信号量控制单次扫描的端口块并发
+        semaphore = _global_semaphore or asyncio.Semaphore(max_concurrent)
 
         async def _bounded_scan(ps, pe):
             async with semaphore:

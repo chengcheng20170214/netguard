@@ -293,11 +293,12 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
 
 
 async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: str | None, scan_task_id: int, all_results: dict, db: AsyncSession, scan_task: ScanTask):
-    """主机发现扫描（逐IP分端口策略）：三阶段串行，阶段3逐IP扫描。
+    """主机发现扫描（逐IP分端口策略）：三阶段串行，阶段3多IP并发扫描。
 
     - 阶段1 Ping → 阶段2 ARP → 阶段3 逐IP分端口扫描
-    - 阶段3: 从targets展开所有IP，逐个IP依次扫描
-    - 每个IP内部: 全端口拆为5000/块(14块)，Semaphore(并发数)并行
+    - 阶段3: 从targets展开所有IP，多个IP并发扫描
+    - max_concurrent 控制**同时运行的 nmap 进程数**（全局共享）
+    - 每个 IP 内部的端口块扫描和跨 IP 的扫描共享同一 Semaphore
     - 进度按IP数量划分: 阶段3进度 = 20 + (已完成IP数 / 总IP数) × 80
     """
     max_concurrent = scan_task.max_concurrent or 4
@@ -383,10 +384,10 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
     await db.commit()
     yield PROGRESS_ARP_END, list(phase_errors.values()), []
 
-    # ===== 阶段3: 逐IP分端口扫描 =====
+    # ===== 阶段3: 逐IP分端口扫描（多IP并发，共享全局 Semaphore） =====
     ip_list = _expand_targets_to_ips(targets)
     total_ips = len(ip_list)
-    await _append_log(db, scan_task, f"[逐IP分端口扫描] 展开 {total_ips} 个IP地址, 逐个扫描")
+    await _append_log(db, scan_task, f"[逐IP分端口扫描] 展开 {total_ips} 个IP地址, 并发数 {max_concurrent}")
 
     scanner_cls = SCANNER_REGISTRY.get("nmap_syn")
     if not scanner_cls:
@@ -397,8 +398,13 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
 
     scanner = scanner_cls()
     completed_ips = 0
+    # 全局 Semaphore: 控制同时运行的 nmap 进程总数
+    # 每个 IP 的 scanner.scan() 内部也会创建端口块并发任务，它们共享此信号量
+    global_semaphore = asyncio.Semaphore(max_concurrent)
 
-    for ip_idx, ip_target in enumerate(ip_list):
+    async def _scan_single_ip(ip_idx: int, ip_target: str):
+        """扫描单个IP的所有端口块，受全局 Semaphore 约束。"""
+        nonlocal completed_ips
         await _append_log(db, scan_task, f"[逐IP分端口扫描] 开始扫描 IP {ip_idx + 1}/{total_ips}: {ip_target}")
 
         ip_results = []
@@ -406,11 +412,13 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
             async def _ip_tcp_progress(msg: str):
                 await _append_log(db, scan_task, f"[TCP端口扫描][{ip_target}] {msg}")
 
+            # 将全局 Semaphore 传入 scanner，让端口块级并发也共享同一配额
             ip_results = await scanner.scan(
                 ip_target, ports,
                 scan_method="nmap_syn", scan_mode=scan_mode,
                 progress_callback=_ip_tcp_progress,
                 max_concurrent=max_concurrent,
+                _global_semaphore=global_semaphore,
             )
             _merge_results(all_results, ip_results)
             ip_port_count = sum(len(r.get("ports", [])) for r in ip_results)
@@ -438,7 +446,13 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
         }
         flag_modified(scan_task, "result_summary")
         await db.commit()
-        yield progress, list(phase_errors.values()), []
+
+    # 并发启动所有IP扫描任务
+    ip_tasks = [
+        asyncio.create_task(_scan_single_ip(ip_idx, ip_target))
+        for ip_idx, ip_target in enumerate(ip_list)
+    ]
+    await asyncio.gather(*ip_tasks)
 
     # 最终持久化
     new_results_data = []

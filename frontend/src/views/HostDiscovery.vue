@@ -42,14 +42,14 @@
           </el-radio-group>
           <div style="margin-top:4px;color:#909399;font-size:12px">
             <span v-if="scanForm.scan_mode === 'standard'">所有IP同时扫描，按端口块(5000/块)并行</span>
-            <span v-else>逐个IP依次扫描，每个IP按端口块(5000/块)并行</span>
+            <span v-else>多IP并发扫描，每个IP按端口块(5000/块)并行</span>
           </div>
         </el-form-item>
         <el-form-item label="发现方法">
           <el-text type="info">自动执行 Ping探测 → ARP探测 → TCP端口扫描</el-text>
         </el-form-item>
         <el-form-item label="并发数">
-          <el-slider v-model="scanForm.max_concurrent" :min="1" :max="8" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8(最大)' }" style="width:300px" />
+          <el-slider v-model="scanForm.max_concurrent" :min="1" :max="16" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8', 16:'16(最大)' }" style="width:300px" />
           <span style="margin-left:12px;color:#909399;font-size:12px">同时运行的 nmap 进程数，越大越快但更占资源</span>
         </el-form-item>
         <el-form-item>
