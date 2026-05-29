@@ -2,9 +2,12 @@ import asyncio
 import ipaddress
 import logging
 import os
+import queue
 import re
 import shlex
+import subprocess
 import tempfile
+import threading
 import time
 
 import nmap
@@ -214,7 +217,7 @@ class NmapScanner(BaseScanner):
         return effective
 
     # ----------------------------------------------------------------
-    # 阶段3：按端口块并发 + 实时进度（兼容 Celery prefork）
+    # 阶段3：按端口块并发 + 实时进度（队列模式，兼容 Celery prefork）
     # ----------------------------------------------------------------
 
     async def _scan_port_chunked(
@@ -222,17 +225,16 @@ class NmapScanner(BaseScanner):
     ) -> list[dict]:
         """全端口TCP扫描：按端口块并发，失败自动重试。
 
-        核心改进:
-        - 智能并发上限：根据 fd/CPU/临时端口动态计算安全并发数
-        - 用 asyncio.to_thread + subprocess.Popen 替代 create_subprocess_exec，
-          解决 Celery prefork 模式下子进程管道兼容性问题
-        - 实时读取 nmap stdout 输出进度行（1秒节流 + 心跳）
+        核心设计:
+        - 同步线程通过 queue.Queue 发送进度消息（线程安全，无需事件循环）
+        - 异步消费者在主事件循环中读取队列并调用 progress_callback（DB 安全）
+        - 彻底解决 Celery prefork 下 asyncio.to_thread 的事件循环问题
         """
         target_list = _split_targets(targets)
         port_chunks = _build_port_chunks()
         total = len(port_chunks)
 
-        # 估算目标主机数（/24≈254, /16≈65534, 单IP=1）
+        # 估算目标主机数
         est_hosts = 0
         for t in target_list:
             try:
@@ -250,8 +252,8 @@ class NmapScanner(BaseScanner):
             )
         max_concurrent = safe_concurrent
 
-        semaphore = asyncio.Semaphore(max_concurrent)
         max_retries = settings.SCAN_CHUNK_MAX_RETRIES
+        msg_queue: queue.Queue = queue.Queue()
 
         await progress_callback(
             f"TCP端口扫描: {len(target_list)} 个网段 × {total} 个端口块 "
@@ -263,69 +265,126 @@ class NmapScanner(BaseScanner):
         failed_chunks: list[str] = []
         global_host_count = 0
         global_port_count = 0
+        active_workers = 0
+        active_lock = threading.Lock()
 
         async def _scan_port_chunk(port_start: int, port_end: int):
-            nonlocal completed, global_host_count, global_port_count
-            async with semaphore:
-                port_spec = f"{port_start}-{port_end}"
-                args = _build_tcp_scan_args(port_spec)
-                nmap_path = settings.NMAP_PATH
-                cmd = [nmap_path] + shlex.split(args) + target_list
+            nonlocal completed, global_host_count, global_port_count, active_workers
+            with active_lock:
+                active_workers += 1
+            port_spec = f"{port_start}-{port_end}"
+            args = _build_tcp_scan_args(port_spec)
+            nmap_path = settings.NMAP_PATH
+            cmd = [nmap_path] + shlex.split(args) + target_list
 
-                for attempt in range(1, max_retries + 2):
-                    xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_p_")
-                    os.close(xml_fd)
-                    cmd_with_xml = cmd + ["-oX", xml_path]
+            for attempt in range(1, max_retries + 2):
+                xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_p_")
+                os.close(xml_fd)
+                cmd_with_xml = cmd + ["-oX", xml_path]
 
-                    try:
-                        # 用 to_thread + 同步 Popen，兼容 Celery prefork
-                        # 在 async 上下文中捕获 loop，传给同步函数
-                        loop = asyncio.get_running_loop()
-                        result = await asyncio.to_thread(
-                            self._run_nmap_with_progress,
-                            cmd_with_xml, xml_path, port_spec,
-                            progress_callback, attempt, max_retries, loop,
-                        )
+                try:
+                    # 同步执行 nmap，通过 msg_queue 传递进度
+                    result = await asyncio.to_thread(
+                        self._run_nmap_sync,
+                        cmd_with_xml, xml_path, port_spec,
+                        msg_queue, attempt, max_retries,
+                    )
 
-                        if result is None:
-                            # 超时/失败且已重试完
-                            if attempt > max_retries:
-                                failed_chunks.append(port_spec)
-                                completed += 1
-                                await progress_callback(
-                                    f"[端口 {port_spec}] 扫描失败, 跳过 ({completed}/{total})"
-                                )
-                                break
-                            else:
-                                await progress_callback(
-                                    f"[端口 {port_spec}] 失败, 第{attempt}次重试..."
-                                )
-                                continue
-
-                        chunk_results, host_count, port_count = result
-                        _merge_results(all_results, chunk_results)
-                        global_host_count = max(global_host_count, host_count)
-                        global_port_count += port_count
-                        completed += 1
-                        await progress_callback(
-                            f"[端口 {port_spec}] 完成 ({completed}/{total}): "
-                            f"{port_count} 个开放端口 (累计 {global_host_count} 主机, {global_port_count} 端口)"
-                        )
-                        break  # 成功跳出重试
-
-                    except Exception as e:
-                        if attempt <= max_retries:
-                            await progress_callback(f"[端口 {port_spec}] 执行失败: {e}, 第{attempt}次重试...")
-                            continue
-                        else:
-                            completed += 1
-                            await progress_callback(f"[端口 {port_spec}] 执行失败, 已达最大重试次数: {e}")
+                    if result is None:
+                        if attempt > max_retries:
                             failed_chunks.append(port_spec)
-                    finally:
-                        if os.path.exists(xml_path):
-                            os.unlink(xml_path)
+                            completed += 1
+                            msg_queue.put(("fail", port_spec, completed, total, 0, 0))
+                            break
+                        else:
+                            msg_queue.put(("retry", port_spec, attempt, 0, 0, 0))
+                            continue
 
-        tasks = [_scan_port_chunk(ps, pe) for ps, pe in port_chunks]
+                    chunk_results, host_count, port_count = result
+                    _merge_results(all_results, chunk_results)
+                    global_host_count = max(global_host_count, host_count)
+                    global_port_count += port_count
+                    completed += 1
+                    msg_queue.put(("done", port_spec, completed, total, port_count, global_port_count))
+                    break
+
+                except Exception as e:
+                    if attempt <= max_retries:
+                        msg_queue.put(("error", port_spec, attempt, 0, 0, 0))
+                        continue
+                    else:
+                        completed += 1
+                        failed_chunks.append(port_spec)
+                        msg_queue.put(("fail", port_spec, completed, total, 0, 0))
+                finally:
+                    if os.path.exists(xml_path):
+                        os.unlink(xml_path)
+
+            with active_lock:
+                active_workers -= 1
+            msg_queue.put(None)  # worker 结束信号
+
+        # 启动所有扫描任务（不 await，让它们在后台跑）
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def _bounded_scan(ps, pe):
+            async with semaphore:
+                await _scan_port_chunk(ps, pe)
+
+        tasks = [asyncio.create_task(_bounded_scan(ps, pe)) for ps, pe in port_chunks]
+
+        # 异步消费者：从队列读取消息，调用 progress_callback
+        total_workers = len(port_chunks)
+        finished_workers = 0
+        last_drain = time.time()
+
+        while finished_workers < total_workers:
+            # 非阻塞消费队列
+            drained = False
+            while not msg_queue.empty():
+                try:
+                    msg = msg_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                if msg is None:
+                    finished_workers += 1
+                    continue
+
+                msg_type = msg[0]
+                if msg_type == "progress":
+                    # ("progress", label, line)
+                    label, line = msg[1], msg[2]
+                    await progress_callback(f"[端口 {label}] {line}")
+                elif msg_type == "done":
+                    _, port_spec, done_cnt, tot, pc, gpc = msg
+                    await progress_callback(
+                        f"[端口 {port_spec}] 完成 ({done_cnt}/{tot}): "
+                        f"{pc} 个开放端口 (累计 {global_port_count} 端口)"
+                    )
+                elif msg_type == "retry":
+                    _, port_spec, att, _, _, _ = msg
+                    await progress_callback(f"[端口 {port_spec}] 失败, 第{att}次重试...")
+                elif msg_type == "error":
+                    _, port_spec, att, _, _, _ = msg
+                    await progress_callback(f"[端口 {port_spec}] 执行失败, 第{att}次重试...")
+                elif msg_type == "fail":
+                    _, port_spec, done_cnt, tot, _, _ = msg
+                    await progress_callback(f"[端口 {port_spec}] 扫描失败, 跳过 ({done_cnt}/{tot})")
+                drained = True
+
+            # 2秒心跳
+            if time.time() - last_drain >= 2 and not drained:
+                if completed > 0 and completed < total:
+                    await progress_callback(
+                        f"TCP端口扫描进行中... ({completed}/{total} 端口块完成, "
+                        f"{global_host_count} 主机, {global_port_count} 开放端口)"
+                    )
+                last_drain = time.time()
+
+            await asyncio.sleep(0.3)
+
+        # 等待所有 task 完成
         await asyncio.gather(*tasks)
 
         total_hosts = len(all_results)
@@ -338,57 +397,30 @@ class NmapScanner(BaseScanner):
 
         return list(all_results.values())
 
-    def _run_nmap_with_progress(
+    def _run_nmap_sync(
         self, cmd: list[str], xml_path: str, label: str,
-        progress_callback, attempt: int, max_retries: int,
-        loop: asyncio.AbstractEventLoop,
+        msg_queue: queue.Queue, attempt: int, max_retries: int
     ) -> tuple[list[dict], int, int] | None:
-        """同步执行 nmap，实时读取 stdout 进度行。
+        """同步执行 nmap，通过 queue.Queue 发送进度消息。
 
-        返回 (results, host_count, port_count) 或 None（超时/失败）。
-        通过 asyncio.run_coroutine_threadsafe 调用异步 progress_callback。
-
-        label: 日志标识（如端口号 "1-5000" 或网段 "192.168.1.0/24"）
+        线程安全：不使用任何 asyncio API，不依赖事件循环。
         """
-        import subprocess
-        import threading
-
         timeout_sec = settings.SCAN_HOST_DISCOVERY_TIMEOUT * 60
         host_count = 0
         port_count = 0
         last_progress_time = 0.0
-        progress_lock = threading.Lock()
-
-        # loop 由调用方在 async 上下文中通过 asyncio.get_running_loop() 捕获后传入
-        # 不能在线程内用 get_event_loop()，否则拿不到主循环
-
-        def _emit_progress(msg: str):
-            nonlocal last_progress_time
-            with progress_lock:
-                now = time.time()
-                if now - last_progress_time >= 1.0:  # 1秒节流
-                    last_progress_time = now
-                    try:
-                        future = asyncio.run_coroutine_threadsafe(
-                            progress_callback(msg), loop
-                        )
-                        future.result(timeout=5)
-                    except Exception as e:
-                        logger.debug(f"progress emit failed: {e}")
 
         try:
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                bufsize=1,  # 行缓冲
+                bufsize=1,
             )
 
             start_time = time.time()
-            last_heartbeat = start_time
             if proc.stdout:
                 for raw_line in proc.stdout:
-                    # 检查总超时
                     if time.time() - start_time > timeout_sec:
                         proc.kill()
                         proc.wait()
@@ -398,30 +430,24 @@ class NmapScanner(BaseScanner):
                     if not line:
                         continue
 
-                    last_heartbeat = time.time()
-
                     # 统计
                     if line.startswith("Nmap scan report for "):
                         host_count += 1
                     if line.startswith("Discovered open port"):
                         port_count += 1
 
-                    # 进度行输出（1秒节流）
+                    # 进度行 → 放入队列（1秒节流）
                     if _PROGRESS_PATTERNS.search(line):
-                        _emit_progress(f"[端口 {label}] {line}")
-
-            # 心跳：30秒无进度行也输出
-            now = time.time()
-            if now - last_heartbeat > 30:
-                elapsed = int(now - start_time)
-                _emit_progress(f"[端口 {label}] 扫描进行中... 已耗时{elapsed}秒")
+                        now = time.time()
+                        if now - last_progress_time >= 1.0:
+                            last_progress_time = now
+                            msg_queue.put(("progress", label, line))
 
             proc.wait(timeout=30)
 
             if proc.returncode != 0:
                 return None
 
-            # 解析 XML 结果
             results = self._parse_xml_results(xml_path)
             return results, host_count, port_count
 
@@ -482,18 +508,12 @@ class NmapScanner(BaseScanner):
                     cmd_with_xml = cmd + ["-oX", xml_path]
 
                     try:
-                        # 用 to_thread + 同步 Popen，兼容 Celery prefork
-                        # 空进度回调，服务发现不需要实时日志
-                        _noop_cb = progress_callback
-                        if _noop_cb is None:
-                            async def _noop_cb(msg: str):
-                                pass
-                        loop = asyncio.get_running_loop()
+                        # 服务发现不需要实时日志，传空队列
+                        noop_queue: queue.Queue = queue.Queue()
                         result = await asyncio.to_thread(
-                            self._run_nmap_with_progress,
+                            self._run_nmap_sync,
                             cmd_with_xml, xml_path, f"{segment}:{port_spec}",
-                            _noop_cb,
-                            attempt, max_retries, loop,
+                            noop_queue, attempt, max_retries,
                         )
 
                         if result is None:
