@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     SCAN_CHUNK_SIZE: int = int(os.getenv("SCAN_CHUNK_SIZE", "5000"))  # 每块端口数
     SCAN_MAX_RETRIES: int = int(os.getenv("SCAN_MAX_RETRIES", "2"))   # 无响应端口重传次数(默认2，减少等待)
     SCAN_MIN_RATE: int = int(os.getenv("SCAN_MIN_RATE", "300"))       # 最低发包速率/秒
-    SCAN_HOST_TIMEOUT_MIN: int = int(os.getenv("SCAN_HOST_TIMEOUT_MIN", "30"))  # 单主机超时(分钟)
+    SCAN_HOST_TIMEOUT_SEC: int = int(os.getenv("SCAN_HOST_TIMEOUT_SEC", "30"))  # 单主机超时(秒)
     SCAN_CHUNK_MAX_RETRIES: int = int(os.getenv("SCAN_CHUNK_MAX_RETRIES", "2"))  # 失败端口块最大重试次数
     SCAN_MAX_RTT_TIMEOUT_MS: int = int(os.getenv("SCAN_MAX_RTT_TIMEOUT_MS", "1000"))  # --max-rtt-timeout 毫秒
     SCAN_INITIAL_RTT_TIMEOUT_MS: int = int(os.getenv("SCAN_INITIAL_RTT_TIMEOUT_MS", "500"))  # --initial-rtt-timeout 毫秒

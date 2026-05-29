@@ -37,6 +37,7 @@ class ScanStatus(str, enum.Enum):
 
 
 class ScanMode(str, enum.Enum):
+    ip_sequential = "ip_sequential"
     standard = "standard"
 
 

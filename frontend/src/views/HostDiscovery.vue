@@ -35,8 +35,18 @@
           <el-input-number v-model="scanForm.interval_minutes" :min="1" :max="10080" />
           <span style="margin-left:8px;color:#909399">分钟</span>
         </el-form-item>
+        <el-form-item label="扫描策略" prop="scan_mode">
+          <el-radio-group v-model="scanForm.scan_mode">
+            <el-radio-button value="standard">分块并行扫描</el-radio-button>
+            <el-radio-button value="ip_sequential">逐IP分端口扫描</el-radio-button>
+          </el-radio-group>
+          <div style="margin-top:4px;color:#909399;font-size:12px">
+            <span v-if="scanForm.scan_mode === 'standard'">所有IP同时扫描，按端口块(5000/块)并行</span>
+            <span v-else>逐个IP依次扫描，每个IP按端口块(5000/块)并行</span>
+          </div>
+        </el-form-item>
         <el-form-item label="发现方法">
-          <el-text type="info">自动执行 Ping探测 → ARP探测 → TCP端口扫描，端口扫描阶段按端口块并行</el-text>
+          <el-text type="info">自动执行 Ping探测 → ARP探测 → TCP端口扫描</el-text>
         </el-form-item>
         <el-form-item label="并发数">
           <el-slider v-model="scanForm.max_concurrent" :min="1" :max="8" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8(最大)' }" style="width:300px" />
@@ -276,7 +286,7 @@ const clearTargets = () => {
 const oneTimeScans = computed(() => scans.value.filter(s => s.scan_type === 'one_time'))
 const periodicScans = computed(() => scans.value.filter(s => s.scan_type === 'periodic'))
 
-const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', max_concurrent: 4, interval_minutes: 60 })
+const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', scan_mode: 'standard', max_concurrent: 4, interval_minutes: 60 })
 const scanRules = {
   name: [{ required: true, message: '请输入任务名称', trigger: 'blur' }],
   targets: [{ required: true, message: '请输入扫描目标', trigger: 'blur' }]
@@ -332,7 +342,7 @@ const handleSubmit = async () => {
   }
   submitting.value = true
   try {
-    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery', scan_methods: ['nmap_ping', 'nmap_arp', 'nmap_syn'], scan_mode: 'standard' }
+    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, scan_mode: scanForm.scan_mode, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery', scan_methods: ['nmap_ping', 'nmap_arp', 'nmap_syn'], }
     await createHostScan(payload)
     ElMessage.success('主机发现任务已创建')
     scanForm.name = ''

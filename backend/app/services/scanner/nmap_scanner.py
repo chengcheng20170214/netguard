@@ -89,7 +89,7 @@ def _build_tcp_scan_args(ports: str | None = None) -> str:
     # 超时优化：减少无响应主机端口等待
     parts.extend(["--max-retries", str(settings.SCAN_MAX_RETRIES)])
     parts.extend(["--min-rate", str(settings.SCAN_MIN_RATE)])
-    parts.extend(["--host-timeout", f"{settings.SCAN_HOST_TIMEOUT_MIN}m"])
+    parts.extend(["--host-timeout", f"{settings.SCAN_HOST_TIMEOUT_SEC}s"])
     parts.extend(["--max-rtt-timeout", f"{settings.SCAN_MAX_RTT_TIMEOUT_MS}ms"])
     parts.extend(["--initial-rtt-timeout", f"{settings.SCAN_INITIAL_RTT_TIMEOUT_MS}ms"])
     parts.extend(["--max-scan-delay", f"{settings.SCAN_MAX_SCAN_DELAY_MS}ms"])
