@@ -173,19 +173,13 @@ class NmapScanner(BaseScanner):
     ) -> int:
         """根据系统资源动态计算安全并发上限。
 
-        约束因素:
-        1. CPU 核数 — nmap 是 CPU 密集型，超过核数并发收益递减
-        2. fd 上限 — 每个 nmap 进程需要 ~target_hosts * 活跃连接数 个 fd
-           -sT 扫描 chunk_ports 个端口 × target_hosts 主机，并发连接约
-           min-rate × RTT ≈ 几十到数百个同时连接
-        3. 临时端口 — 内核 ip_local_port_range 限制了源端口数
-        4. 用户设定 — 不能超过用户在前端设定的值
+        nmap -sT 实际 fd 消耗:
+        - nmap 内部用 poll/select 调度并发连接，同时活跃连接数 ≈ min_rate × avg_rtt
+        - 局域网 RTT <1ms + min_rate=300 → 峰值约 300 个并发 socket
+        - 每个目标主机还有 1 个 fd 用于调度，加上 nmap 内部 fd
+        - 实测: 扫描 500 主机 × 5000 端口块，nmap 峰值 fd 约 500-800
 
-        计算公式:
-          safe_by_fd = (ulimit_n - 256) / (target_hosts * min(50, chunk_ports/100) + 20)
-          safe_by_cpu = cpu_count
-          safe_by_port = local_port_range / (chunk_ports * 2)  # 每进程复用源端口
-          effective = min(user_concurrent, safe_by_fd, safe_by_cpu, safe_by_port, 16)
+        因此按保守估算: 每进程 fd = min(800, target_hosts + 300)
         """
         import multiprocessing
 
@@ -196,7 +190,7 @@ class NmapScanner(BaseScanner):
             fd_limit = 1024
 
         # 读取临时端口范围
-        local_ports = 28000  # 默认估值
+        local_ports = 28000
         try:
             with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
                 lo, hi = f.read().split()
@@ -204,15 +198,15 @@ class NmapScanner(BaseScanner):
         except Exception:
             pass
 
-        # 估算单个 nmap 进程的 fd 需求
-        # -sT 扫描: 同时活跃连接数 ≈ min_rate * avg_rtt
-        # 局域网 RTT <1ms → ~300 连接, 公网 RTT ~50ms → ~15 连接
-        # 保守取: target_hosts * min(50, chunk_ports/100) + 20(内部fd)
-        est_fds_per_proc = max(target_hosts * min(50, chunk_ports // 100) + 20, 50)
+        # 实际估算: nmap 同时活跃连接 ≈ min_rate * RTT，约 300 个 socket
+        # 加上每个目标主机的调度开销 + nmap 内部 fd
+        est_fds_per_proc = min(800, target_hosts + 300)
 
         safe_by_fd = max(1, (fd_limit - 256) // est_fds_per_proc)
         safe_by_cpu = max(1, cpu_count)
-        safe_by_port = max(1, local_ports // (chunk_ports * 2))
+        # 临时端口: 每个并发连接占用 1 个源端口，nmap 复用已关闭的端口
+        # 保守: 每进程峰值 300 连接，复用源端口
+        safe_by_port = max(1, local_ports // 300)
 
         effective = min(user_concurrent, safe_by_fd, safe_by_cpu, safe_by_port, 16)
         effective = max(1, effective)
@@ -285,10 +279,12 @@ class NmapScanner(BaseScanner):
 
                     try:
                         # 用 to_thread + 同步 Popen，兼容 Celery prefork
+                        # 在 async 上下文中捕获 loop，传给同步函数
+                        loop = asyncio.get_running_loop()
                         result = await asyncio.to_thread(
                             self._run_nmap_with_progress,
                             cmd_with_xml, xml_path, port_spec,
-                            progress_callback, attempt, max_retries,
+                            progress_callback, attempt, max_retries, loop,
                         )
 
                         if result is None:
@@ -344,7 +340,8 @@ class NmapScanner(BaseScanner):
 
     def _run_nmap_with_progress(
         self, cmd: list[str], xml_path: str, label: str,
-        progress_callback, attempt: int, max_retries: int
+        progress_callback, attempt: int, max_retries: int,
+        loop: asyncio.AbstractEventLoop,
     ) -> tuple[list[dict], int, int] | None:
         """同步执行 nmap，实时读取 stdout 进度行。
 
@@ -362,8 +359,8 @@ class NmapScanner(BaseScanner):
         last_progress_time = 0.0
         progress_lock = threading.Lock()
 
-        # 用于从线程安全调用异步 callback
-        loop = asyncio.get_event_loop()
+        # loop 由调用方在 async 上下文中通过 asyncio.get_running_loop() 捕获后传入
+        # 不能在线程内用 get_event_loop()，否则拿不到主循环
 
         def _emit_progress(msg: str):
             nonlocal last_progress_time
@@ -376,8 +373,8 @@ class NmapScanner(BaseScanner):
                             progress_callback(msg), loop
                         )
                         future.result(timeout=5)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"progress emit failed: {e}")
 
         try:
             proc = subprocess.Popen(
@@ -491,11 +488,12 @@ class NmapScanner(BaseScanner):
                         if _noop_cb is None:
                             async def _noop_cb(msg: str):
                                 pass
+                        loop = asyncio.get_running_loop()
                         result = await asyncio.to_thread(
                             self._run_nmap_with_progress,
                             cmd_with_xml, xml_path, f"{segment}:{port_spec}",
                             _noop_cb,
-                            attempt, max_retries,
+                            attempt, max_retries, loop,
                         )
 
                         if result is None:
