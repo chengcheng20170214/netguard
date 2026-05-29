@@ -14,6 +14,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# 全局 DB 写入锁：防止并发 asyncio 任务同时 commit 同一个 session
+_db_lock = asyncio.Lock()
+
 
 def generate_fingerprint(mac: str | None, hostname: str | None, os: str | None, ip: str) -> str:
     if mac:
@@ -26,15 +29,17 @@ def generate_fingerprint(mac: str | None, hostname: str | None, os: str | None, 
 
 
 async def _append_log(db: AsyncSession, scan_task: ScanTask, message: str):
-    if scan_task.scan_log is None:
-        scan_task.scan_log = []
-    scan_task.scan_log.append({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "msg": message
-    })
-    from sqlalchemy.orm.attributes import flag_modified
-    flag_modified(scan_task, "scan_log")
-    await db.commit()
+    """安全追加日志：通过全局锁防止并发 commit 导致 SQLAlchemy 错误。"""
+    async with _db_lock:
+        if scan_task.scan_log is None:
+            scan_task.scan_log = []
+        scan_task.scan_log.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "msg": message
+        })
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(scan_task, "scan_log")
+        await db.commit()
 
 
 def _build_chunk_ranges(chunk_size: int | None = None) -> list[tuple[int, int]]:
@@ -196,7 +201,8 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
         "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
     }
     flag_modified(scan_task, "result_summary")
-    await db.commit()
+    async with _db_lock:
+        await db.commit()
     yield total_phase_progress, list(phase_errors.values()), []
 
     # ===== 阶段2: ARP探测 =====
@@ -238,7 +244,8 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
         "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
     }
     flag_modified(scan_task, "result_summary")
-    await db.commit()
+    async with _db_lock:
+        await db.commit()
     yield total_phase_progress, list(phase_errors.values()), []
 
     # ===== 阶段3: TCP端口扫描 (按端口块并发) =====
@@ -297,8 +304,8 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
 
     - 阶段1 Ping → 阶段2 ARP → 阶段3 逐IP分端口扫描
     - 阶段3: 从targets展开所有IP，多个IP并发扫描
-    - max_concurrent 控制**同时运行的 nmap 进程数**（全局共享）
-    - 每个 IP 内部的端口块扫描和跨 IP 的扫描共享同一 Semaphore
+    - max_concurrent 控制**同时扫描的IP数**（IP级 Semaphore）
+    - 每个IP内部按端口块并行扫描（创建独立的内部 Semaphore）
     - 进度按IP数量划分: 阶段3进度 = 20 + (已完成IP数 / 总IP数) × 80
     """
     max_concurrent = scan_task.max_concurrent or 4
@@ -341,7 +348,8 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
         "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
     }
     flag_modified(scan_task, "result_summary")
-    await db.commit()
+    async with _db_lock:
+        await db.commit()
     yield PROGRESS_PING_END, list(phase_errors.values()), []
 
     # ===== 阶段2: ARP探测 =====
@@ -381,13 +389,14 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
         "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
     }
     flag_modified(scan_task, "result_summary")
-    await db.commit()
+    async with _db_lock:
+        await db.commit()
     yield PROGRESS_ARP_END, list(phase_errors.values()), []
 
-    # ===== 阶段3: 逐IP分端口扫描（多IP并发，共享全局 Semaphore） =====
+    # ===== 阶段3: 逐IP分端口扫描（IP级并发） =====
     ip_list = _expand_targets_to_ips(targets)
     total_ips = len(ip_list)
-    await _append_log(db, scan_task, f"[逐IP分端口扫描] 展开 {total_ips} 个IP地址, 并发数 {max_concurrent}")
+    await _append_log(db, scan_task, f"[逐IP分端口扫描] 展开 {total_ips} 个IP地址, 同时扫描 {max_concurrent} 个IP")
 
     scanner_cls = SCANNER_REGISTRY.get("nmap_syn")
     if not scanner_cls:
@@ -396,58 +405,61 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
         yield progress, list(phase_errors.values()), []
         return
 
-    scanner = scanner_cls()
     completed_ips = 0
-    # 全局 Semaphore: 控制同时运行的 nmap 进程总数
-    # 每个 IP 的 scanner.scan() 内部也会创建端口块并发任务，它们共享此信号量
-    global_semaphore = asyncio.Semaphore(max_concurrent)
+    # IP级 Semaphore: 控制同时扫描的IP数量
+    # 每个IP内部由 scanner.scan() 自己创建内部 Semaphore 控制端口块并发
+    ip_semaphore = asyncio.Semaphore(max_concurrent)
 
     async def _scan_single_ip(ip_idx: int, ip_target: str):
-        """扫描单个IP的所有端口块，受全局 Semaphore 约束。"""
+        """扫描单个IP的所有端口块，受 IP 级 Semaphore 约束。"""
         nonlocal completed_ips
-        await _append_log(db, scan_task, f"[逐IP分端口扫描] 开始扫描 IP {ip_idx + 1}/{total_ips}: {ip_target}")
+        async with ip_semaphore:
+            await _append_log(db, scan_task, f"[逐IP分端口扫描] 开始扫描 IP {ip_idx + 1}/{total_ips}: {ip_target}")
 
-        ip_results = []
-        try:
-            async def _ip_tcp_progress(msg: str):
-                await _append_log(db, scan_task, f"[TCP端口扫描][{ip_target}] {msg}")
+            ip_results = []
+            try:
+                # 每个IP创建独立的scanner实例（避免共享状态）
+                ip_scanner = scanner_cls()
 
-            # 将全局 Semaphore 传入 scanner，让端口块级并发也共享同一配额
-            ip_results = await scanner.scan(
-                ip_target, ports,
-                scan_method="nmap_syn", scan_mode=scan_mode,
-                progress_callback=_ip_tcp_progress,
-                max_concurrent=max_concurrent,
-                _global_semaphore=global_semaphore,
-            )
-            _merge_results(all_results, ip_results)
-            ip_port_count = sum(len(r.get("ports", [])) for r in ip_results)
-            await _append_log(db, scan_task, f"[逐IP分端口扫描] IP {ip_target} 完成: 发现 {ip_port_count} 个开放端口")
-        except Exception as e:
-            phase_errors[f"nmap_syn_{ip_target}"] = str(e)
-            logger.warning(f"TCP port scan failed for IP {ip_target} in task {scan_task_id}: {e}")
-            await _append_log(db, scan_task, f"[逐IP分端口扫描] IP {ip_target} 失败: {e}")
+                async def _ip_tcp_progress(msg: str):
+                    await _append_log(db, scan_task, f"[TCP端口扫描][{ip_target}] {msg}")
 
-        # 持久化该IP结果
-        for r in ip_results:
-            r_ip = r.get("ip")
-            if r_ip:
-                await persist_host_incremental(db, scan_task_id, r_ip, r)
+                # 不传 _global_semaphore：每个IP内部独立控制端口块并发
+                ip_results = await ip_scanner.scan(
+                    ip_target, ports,
+                    scan_method="nmap_syn", scan_mode=scan_mode,
+                    progress_callback=_ip_tcp_progress,
+                    max_concurrent=max_concurrent,
+                )
+                _merge_results(all_results, ip_results)
+                ip_port_count = sum(len(r.get("ports", [])) for r in ip_results)
+                await _append_log(db, scan_task, f"[逐IP分端口扫描] IP {ip_target} 完成: 发现 {ip_port_count} 个开放端口")
+            except Exception as e:
+                phase_errors[f"nmap_syn_{ip_target}"] = str(e)
+                logger.warning(f"TCP port scan failed for IP {ip_target} in task {scan_task_id}: {e}")
+                await _append_log(db, scan_task, f"[逐IP分端口扫描] IP {ip_target} 失败: {e}")
 
-        completed_ips += 1
+            # 持久化该IP结果
+            for r in ip_results:
+                r_ip = r.get("ip")
+                if r_ip:
+                    await persist_host_incremental(db, scan_task_id, r_ip, r)
 
-        # 计算进度: 阶段3进度 = 20 + (已完成IP数 / 总IP数) × 80
-        progress = int(PROGRESS_ARP_END + (completed_ips / total_ips) * 80) if total_ips > 0 else 100
-        scan_task.progress = progress
-        flag_modified(scan_task, "scan_log")
-        scan_task.result_summary = {
-            "total_hosts": len(all_results),
-            "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
-        }
-        flag_modified(scan_task, "result_summary")
-        await db.commit()
+            completed_ips += 1
 
-    # 并发启动所有IP扫描任务
+            # 计算进度: 阶段3进度 = 20 + (已完成IP数 / 总IP数) × 80
+            progress = int(PROGRESS_ARP_END + (completed_ips / total_ips) * 80) if total_ips > 0 else 100
+            async with _db_lock:
+                scan_task.progress = progress
+                flag_modified(scan_task, "scan_log")
+                scan_task.result_summary = {
+                    "total_hosts": len(all_results),
+                    "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
+                }
+                flag_modified(scan_task, "result_summary")
+                await db.commit()
+
+    # 并发启动所有IP扫描任务（ip_semaphore 限制同时进行的IP数）
     ip_tasks = [
         asyncio.create_task(_scan_single_ip(ip_idx, ip_target))
         for ip_idx, ip_target in enumerate(ip_list)
@@ -663,91 +675,93 @@ def _merge_results(all_results: dict, scan_results: list[dict]):
 
 
 async def persist_host_incremental(db: AsyncSession, scan_task_id: int, ip: str, data: dict) -> dict | None:
-    from app.models.models import AssetChange, ChangeType, ChangeSeverity
+    """持久化单个主机扫描结果，通过全局锁防止并发commit。"""
+    async with _db_lock:
+        from app.models.models import AssetChange, ChangeType, ChangeSeverity
 
-    mac = data.get("mac")
-    hostname = data.get("hostname")
-    os_name = data.get("os")
-    fp = generate_fingerprint(mac, hostname, os_name, ip)
+        mac = data.get("mac")
+        hostname = data.get("hostname")
+        os_name = data.get("os")
+        fp = generate_fingerprint(mac, hostname, os_name, ip)
 
-    asset = None
-    fp_result = await db.execute(select(Asset).where(Asset.fingerprint == fp))
-    asset = fp_result.scalar_one_or_none()
+        asset = None
+        fp_result = await db.execute(select(Asset).where(Asset.fingerprint == fp))
+        asset = fp_result.scalar_one_or_none()
 
-    if asset and asset.ip != ip:
-        old_ip = asset.ip
-        asset.ip = ip
-        change = AssetChange(
-            asset_id=asset.id, ip=ip, change_type=ChangeType.ip_changed,
-            detail={"field": "ip", "old": old_ip, "new": ip},
-            severity=ChangeSeverity.info, detected_at=datetime.now(timezone.utc)
+        if asset and asset.ip != ip:
+            old_ip = asset.ip
+            asset.ip = ip
+            change = AssetChange(
+                asset_id=asset.id, ip=ip, change_type=ChangeType.ip_changed,
+                detail={"field": "ip", "old": old_ip, "new": ip},
+                severity=ChangeSeverity.info, detected_at=datetime.now(timezone.utc)
+            )
+            db.add(change)
+        elif not asset:
+            ip_result = await db.execute(select(Asset).where(Asset.ip == ip))
+            asset = ip_result.scalar_one_or_none()
+            if asset and not asset.fingerprint:
+                asset.fingerprint = fp
+
+        scan_result = ScanResult(
+            scan_task_id=scan_task_id, ip=ip, mac=mac,
+            hostname=hostname, os=os_name,
+            ports=data.get("ports", []), created_at=datetime.now(timezone.utc)
         )
-        db.add(change)
-    elif not asset:
-        ip_result = await db.execute(select(Asset).where(Asset.ip == ip))
-        asset = ip_result.scalar_one_or_none()
-        if asset and not asset.fingerprint:
-            asset.fingerprint = fp
+        db.add(scan_result)
 
-    scan_result = ScanResult(
-        scan_task_id=scan_task_id, ip=ip, mac=mac,
-        hostname=hostname, os=os_name,
-        ports=data.get("ports", []), created_at=datetime.now(timezone.utc)
-    )
-    db.add(scan_result)
+        if not asset:
+            asset = Asset(
+                ip=ip, mac=mac, hostname=hostname, os=os_name,
+                fingerprint=fp, current_ports=data.get("ports", []),
+                is_online=True, first_seen=datetime.now(timezone.utc),
+                last_seen=datetime.now(timezone.utc)
+            )
+            db.add(asset)
+            await db.commit()
+            await db.refresh(asset)
+            await create_snapshot(db, asset, scan_task_id)
+        else:
+            prev_snapshot_result = await db.execute(
+                select(AssetSnapshot).where(AssetSnapshot.asset_id == asset.id)
+                .order_by(AssetSnapshot.created_at.desc()).limit(1)
+            )
+            prev_snapshot = prev_snapshot_result.scalar_one_or_none()
 
-    if not asset:
-        asset = Asset(
-            ip=ip, mac=mac, hostname=hostname, os=os_name,
-            fingerprint=fp, current_ports=data.get("ports", []),
-            is_online=True, first_seen=datetime.now(timezone.utc),
-            last_seen=datetime.now(timezone.utc)
-        )
-        db.add(asset)
-        await db.commit()
-        await db.refresh(asset)
-        await create_snapshot(db, asset, scan_task_id)
-    else:
-        prev_snapshot_result = await db.execute(
-            select(AssetSnapshot).where(AssetSnapshot.asset_id == asset.id)
-            .order_by(AssetSnapshot.created_at.desc()).limit(1)
-        )
-        prev_snapshot = prev_snapshot_result.scalar_one_or_none()
+            existing_port_keys = {f"{p['port']}/{p.get('proto', 'tcp')}" for p in (asset.current_ports or [])}
+            merged_ports = list(asset.current_ports or [])
+            for p in (data.get("ports") or []):
+                key = f"{p['port']}/{p.get('proto', 'tcp')}"
+                if key not in existing_port_keys:
+                    merged_ports.append(p)
+                    existing_port_keys.add(key)
 
-        existing_port_keys = {f"{p['port']}/{p.get('proto', 'tcp')}" for p in (asset.current_ports or [])}
-        merged_ports = list(asset.current_ports or [])
-        for p in (data.get("ports") or []):
-            key = f"{p['port']}/{p.get('proto', 'tcp')}"
-            if key not in existing_port_keys:
-                merged_ports.append(p)
-                existing_port_keys.add(key)
+            asset.mac = mac or asset.mac
+            asset.hostname = hostname or asset.hostname
+            asset.os = os_name or asset.os
+            asset.current_ports = merged_ports
+            asset.is_online = True
+            asset.last_seen = datetime.now(timezone.utc)
+            if not asset.fingerprint:
+                asset.fingerprint = fp
+            await db.commit()
+            await db.refresh(asset)
 
-        asset.mac = mac or asset.mac
-        asset.hostname = hostname or asset.hostname
-        asset.os = os_name or asset.os
-        asset.current_ports = merged_ports
-        asset.is_online = True
-        asset.last_seen = datetime.now(timezone.utc)
-        if not asset.fingerprint:
-            asset.fingerprint = fp
-        await db.commit()
-        await db.refresh(asset)
+            new_snapshot = await create_snapshot(db, asset, scan_task_id)
+            if prev_snapshot:
+                await compare_snapshots(db, prev_snapshot, new_snapshot)
 
-        new_snapshot = await create_snapshot(db, asset, scan_task_id)
-        if prev_snapshot:
-            await compare_snapshots(db, prev_snapshot, new_snapshot)
-
-    await db.refresh(scan_result)
-    return {
-        "id": scan_result.id,
-        "scan_task_id": scan_task_id,
-        "ip": ip,
-        "mac": mac,
-        "hostname": hostname,
-        "os": os_name,
-        "ports": data.get("ports", []),
-        "created_at": scan_result.created_at.isoformat() if scan_result.created_at else None,
-    }
+        await db.refresh(scan_result)
+        return {
+            "id": scan_result.id,
+            "scan_task_id": scan_task_id,
+            "ip": ip,
+            "mac": mac,
+            "hostname": hostname,
+            "os": os_name,
+            "ports": data.get("ports", []),
+            "created_at": scan_result.created_at.isoformat() if scan_result.created_at else None,
+        }
 
 
 async def persist_results(db: AsyncSession, scan_task_id: int, all_results: dict):
@@ -768,7 +782,8 @@ async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id
         scan_task.scan_log = [{"ts": datetime.now(timezone.utc).isoformat(), "msg": "任务开始执行"}]
         if celery_task_id:
             scan_task.celery_task_id = celery_task_id
-        await db.commit()
+        async with _db_lock:
+            await db.commit()
 
         all_results = {}
         try:
@@ -803,7 +818,8 @@ async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id
                     }
                     from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(scan_task, "result_summary")
-                    await db.commit()
+                    async with _db_lock:
+                        await db.commit()
                     if progress_callback:
                         progress_callback(progress)
             else:
@@ -824,7 +840,8 @@ async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id
                     }
                     from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(scan_task, "result_summary")
-                    await db.commit()
+                    async with _db_lock:
+                        await db.commit()
                     if progress_callback:
                         progress_callback(progress)
 
@@ -856,7 +873,8 @@ async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id
             "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
             "chunk_stats": await _get_chunk_stats(db, scan_task_id),
         }
-        await db.commit()
+        async with _db_lock:
+            await db.commit()
 
 
 async def _get_chunk_stats(db: AsyncSession, scan_task_id: int) -> dict:
