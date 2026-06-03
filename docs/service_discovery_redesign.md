@@ -1134,39 +1134,49 @@ def _profile_to_methods(profile: ScanProfile) -> list[str]:
 
 ## 九、待讨论的设计细节
 
-### 9.1 阶段2/3 按IP串行 vs 并行
+### 9.1 阶段2/3 执行策略：按IP串行 vs 分组并行
 
-**当前方案：** 阶段2/3 对 `open_ports_map` 中每个 IP 逐个执行 nmap 调用
+**背景：** 阶段2/3 只对阶段1发现的开放端口做定向探测（通常每IP几个到几十个端口），不是全端口扫描。
 
-**问题：** 如果发现 100 个存活主机，阶段2 要跑 100 次 nmap，串行太慢
+**两种方案：**
 
-**可选方案：**
+| 方案 | 逻辑 | 优点 | 缺点 |
+|------|------|------|------|
+| **A. 逐IP串行** | 每次nmap扫1个IP，只扫该IP的开放端口 | 简单，端口参数精确 | nmap启动开销×IP数，100个IP跑100次 |
+| **B. 分组并行** | N个IP一组，端口取并集，1次nmap扫整组 | nmap启动次数少，并发快 | 部分IP被多扫几个关闭端口（RST响应<1ms，可忽略） |
 
-| 方案 | 优点 | 缺点 |
-|------|------|------|
-| A. 按IP串行 | 简单，资源占用低 | 100个IP很慢 |
-| B. 按IP分组并行 | 和阶段1一样按组并发 | 需要合并不同组的端口列表 |
-| C. 所有IP合并为1次nmap | 最快 | 端口参数变长（-p 22,80,443,...），不同IP不同端口无法合并 |
-| D. 按端口分组 | 相同端口的IP合并扫描 | 实现复杂 |
-
-**推荐方案B：** 复用 `_split_ips_into_groups` 逻辑，每组IP合并为1次nmap调用，但端口取组内所有IP端口的并集。
+**决策：两种方案都实现，通过 profile.timing 新增字段切换，实测后选定一种。**
 
 ```python
-# 方案B：按组并发，端口取并集
+# timing 配置新增字段
+"phase_executor": "grouped"  # "serial" = 方案A逐IP串行, "grouped" = 方案B分组并行
+```
+
+```python
+# 方案A：逐IP串行 —— 精确端口，每次nmap只扫该IP的开放端口
+for ip, ports in open_ports_map.items():
+    port_spec = ",".join(str(p) for p in ports)
+    args = f"-sT -sV --version-intensity {intensity} -p {port_spec} {ip} -Pn -n -T4 ..."
+    results = await scanner.scan_with_args(ip, args)
+
+# 方案B：分组并行 —— 复用 _split_ips_into_groups，组内端口取并集
 for ip_group in ip_groups:
-    # 组内所有IP的开放端口取并集
     group_ports = set()
     for ip in ip_group:
         group_ports.update(open_ports_map.get(ip, []))
     port_spec = ",".join(str(p) for p in sorted(group_ports))
 
-    # 一次nmap扫描整组
     targets = " ".join(ip_group)
     args = f"-sT -sV --version-intensity {intensity} -p {port_spec} -Pn -n -T4 ..."
     results = await scanner.scan_with_args(targets, args)
-
     # 结果会包含组内所有IP的信息，有些IP可能没有某个端口的结果（正常）
 ```
+
+**实测计划：**
+1. Phase 2 实现时两种方案都编码，通过 `phase_executor` 参数切换
+2. 内置预设默认用 `grouped`，自定义策略可选 `serial`
+3. 对同一目标（如 /24 网段 ~50 存活主机）分别跑两种方案，记录耗时
+4. 根据实测数据决定最终默认值，淘汰劣势方案（或保留为高级选项）
 
 ### 9.2 NSE 脚本分类选择 UI
 
