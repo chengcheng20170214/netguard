@@ -1,16 +1,5 @@
 import api from './index'
 
-// Legacy endpoints (backward compat)
-export const createScan = (data) => api.post('/scans', data)
-export const getScans = (params) => api.get('/scans', { params })
-export const getScanDetail = (id) => api.get("/scans/" + id)
-export const cancelScan = (id) => api.post("/scans/" + id + "/cancel")
-export const updateScan = (id, data) => api.put("/scans/" + id, data)
-export const activateScan = (id) => api.post("/scans/" + id + "/activate")
-export const deactivateScan = (id) => api.post("/scans/" + id + "/deactivate")
-export const deleteScan = (id) => api.delete("/scans/" + id)
-export const rescanScan = (id) => api.post("/scans/" + id + "/rescan")
-
 // Host discovery
 export const createHostScan = (data) => api.post('/host-scans', data)
 export const getHostScans = (params) => api.get('/host-scans', { params })

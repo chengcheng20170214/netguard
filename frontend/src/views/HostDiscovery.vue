@@ -46,7 +46,7 @@
           </div>
         </el-form-item>
         <el-form-item label="发现方法">
-          <el-text type="info">自动执行 Ping探测 → ARP探测 → TCP端口扫描</el-text>
+          <el-text type="info">自动执行 Ping探测 → Top1000端口发现</el-text>
         </el-form-item>
         <el-form-item label="并发数">
           <el-slider v-model="scanForm.max_concurrent" :min="1" :max="16" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8', 16:'16(最大)' }" style="width:300px" />
@@ -342,7 +342,7 @@ const handleSubmit = async () => {
   }
   submitting.value = true
   try {
-    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, scan_mode: scanForm.scan_mode, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery', scan_methods: ['nmap_ping', 'nmap_arp', 'nmap_syn'], }
+    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, scan_mode: scanForm.scan_mode, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery', scan_methods: ['nmap_ping', 'nmap_syn'], }
     await createHostScan(payload)
     ElMessage.success('主机发现任务已创建')
     scanForm.name = ''

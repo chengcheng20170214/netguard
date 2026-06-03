@@ -34,7 +34,7 @@
         </el-form-item>
         <el-form-item label="扫描模式" prop="scan_mode">
           <el-radio-group v-model="scanForm.scan_mode">
-            <el-tooltip content="仅扫描常见Top100端口，速度最快，适合快速摸底" placement="top">
+            <el-tooltip content="仅扫描常见Top1000端口，速度最快，适合快速摸底" placement="top">
               <el-radio-button value="quick">快速扫描</el-radio-button>
             </el-tooltip>
             <el-tooltip content="扫描所有指定端口+服务识别，平衡速度与精度，日常推荐" placement="top">

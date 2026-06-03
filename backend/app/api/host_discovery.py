@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/host-scans", tags=["主机发现"])
 
-HOST_METHODS = {ScanMethod.nmap_ping, ScanMethod.nmap_arp, ScanMethod.nmap_syn}
+HOST_METHODS = {ScanMethod.nmap_ping, ScanMethod.nmap_syn}
 
 
 async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
@@ -65,7 +65,7 @@ async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db),
     task = ScanTask(
         name=req.name, targets=req.targets, scan_category=ScanCategory.host_discovery,
         scan_type=req.scan_type, scan_mode=req.scan_mode,
-        scan_methods=["nmap_ping", "nmap_arp", "nmap_syn"],
+        scan_methods=["nmap_ping", "nmap_syn"],
         ports=req.ports, max_concurrent=req.max_concurrent, interval_minutes=req.interval_minutes,
         created_by=current_user.id, next_run=next_run,
         is_active=True

@@ -28,7 +28,7 @@
 <script setup>
 import { ref, reactive, onMounted, nextTick } from 'vue'
 import * as echarts from 'echarts'
-import { getScans } from '../api/discovery'
+import { getHostScans, getServiceScans } from '../api/discovery'
 import { getAssets, getAllChanges } from '../api/assets'
 import { getVulns } from '../api/vulns'
 
@@ -42,15 +42,18 @@ const statusLabel = (s) => ({ pending: '等待中', running: '扫描中', comple
 
 onMounted(async () => {
   try {
-    const [assetsRes, vulnsRes, changesRes, scansRes] = await Promise.all([
-      getAssets({ limit: 1 }), getVulns({ limit: 1 }), getAllChanges({ limit: 1 }), getScans({ limit: 10 })
+    const [assetsRes, vulnsRes, changesRes, hostScansRes, serviceScansRes] = await Promise.all([
+      getAssets({ limit: 1 }), getVulns({ limit: 1 }), getAllChanges({ limit: 1 }), getHostScans({ limit: 10 }), getServiceScans({ limit: 10 })
     ])
     const assetData = assetsRes.data
     stats.totalAssets = assetData.total || 0
     stats.onlineAssets = (assetData.items || []).filter(a => a.is_online).length
     stats.vulns = vulnsRes.data.total || 0
     stats.recentChanges = changesRes.data.total || 0
-    recentScans.value = scansRes.data.items || []
+    const hostItems = hostScansRes.data.items || []
+    const serviceItems = serviceScansRes.data.items || []
+    const allScans = [...hostItems, ...serviceItems].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 10)
+    recentScans.value = allScans
   } catch (e) { console.error(e) }
 
   await nextTick()

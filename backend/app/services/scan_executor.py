@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 # 全局 DB 写入锁：防止并发 asyncio 任务同时 commit 同一个 session
 _db_lock = asyncio.Lock()
 
+# 端口分块大小
+PORT_CHUNK_SIZE = 5000
+
 
 def generate_fingerprint(mac: str | None, hostname: str | None, os: str | None, ip: str) -> str:
     if mac:
@@ -42,12 +45,26 @@ async def _append_log(db: AsyncSession, scan_task: ScanTask, message: str):
         await db.commit()
 
 
-def _build_chunk_ranges(chunk_size: int | None = None) -> list[tuple[int, int]]:
-    size = chunk_size or settings.SCAN_CHUNK_SIZE
+async def _update_progress(db: AsyncSession, scan_task: ScanTask, progress: int, all_results: dict):
+    """更新扫描进度和摘要，通过全局锁安全写入。"""
+    from sqlalchemy.orm.attributes import flag_modified
+    async with _db_lock:
+        scan_task.progress = progress
+        flag_modified(scan_task, "scan_log")
+        scan_task.result_summary = {
+            "total_hosts": len(all_results),
+            "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
+        }
+        flag_modified(scan_task, "result_summary")
+        await db.commit()
+
+
+def _build_port_ranges(chunk_size: int = PORT_CHUNK_SIZE) -> list[tuple[int, int]]:
+    """将 1-65535 拆分为端口块列表。"""
     ranges = []
     start = 1
     while start <= 65535:
-        end = min(start + size - 1, 65535)
+        end = min(start + chunk_size - 1, 65535)
         ranges.append((start, end))
         start = end + 1
     return ranges
@@ -100,6 +117,11 @@ def _expand_targets_to_ips(targets: str) -> list[str]:
     return ips
 
 
+def _split_ips_into_groups(ip_list: list[str], group_size: int) -> list[list[str]]:
+    """将IP列表按指定大小分组。"""
+    return [ip_list[i:i + group_size] for i in range(0, len(ip_list), group_size)]
+
+
 async def _ensure_chunks(db: AsyncSession, scan_task_id: int, scan_task: ScanTask):
     existing = await db.execute(
         select(ScanChunk).where(ScanChunk.scan_task_id == scan_task_id)
@@ -107,7 +129,7 @@ async def _ensure_chunks(db: AsyncSession, scan_task_id: int, scan_task: ScanTas
     if existing.scalars().first():
         return
 
-    chunk_ranges = _build_chunk_ranges()
+    chunk_ranges = _build_port_ranges()
     for port_start, port_end in chunk_ranges:
         chunk = ScanChunk(
             scan_task_id=scan_task_id,
@@ -117,7 +139,7 @@ async def _ensure_chunks(db: AsyncSession, scan_task_id: int, scan_task: ScanTas
         )
         db.add(chunk)
     await db.commit()
-    await _append_log(db, scan_task, f"已创建 {len(chunk_ranges)} 个扫描分块 (每块 {settings.SCAN_CHUNK_SIZE} 端口)")
+    await _append_log(db, scan_task, f"已创建 {len(chunk_ranges)} 个扫描分块 (每块 {PORT_CHUNK_SIZE} 端口)")
 
 
 async def _retry_failed_chunks(db: AsyncSession, scan_task_id: int, scan_task: ScanTask):
@@ -143,139 +165,254 @@ async def _retry_failed_chunks(db: AsyncSession, scan_task_id: int, scan_task: S
     return len(failed_chunks)
 
 
-HOST_DISCOVERY_PIPELINE = ["nmap_ping", "nmap_arp", "nmap_syn"]
-
-# 进度分配：阶段1(0-10%) + 阶段2(10-20%) + 阶段3(20-100%)
-PROGRESS_PING_END = 10
-PROGRESS_ARP_END = 20
+# 进度分配：阶段1(0-30%) + 阶段2(30-100%)
+PROGRESS_PHASE1_END = 30
 
 
-async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, scan_task_id: int, all_results: dict, db: AsyncSession, scan_task: ScanTask):
-    """主机发现扫描：三阶段串行（Ping→ARP→TCP端口扫描），阶段3内部按端口块并行。
+# ========================================================================
+# 阶段1: Ping探测（两种策略共用）
+# ========================================================================
 
-    - 阶段1 Ping (~5-15秒) → 阶段2 ARP (~5秒) → 阶段3 TCP端口扫描 (最耗时)
-    - 阶段3: 全端口拆为5000/块(14块)，Semaphore(并发数)并行
-    - 所有nmap操作使用 -sT (TCP Connect)，不需要root权限
-    - 每阶段失败不影响后续阶段，端口块失败自动重试2次
+async def _phase1_ping(targets: str, scan_mode: str, max_concurrent: int,
+                        scan_task_id: int, all_results: dict,
+                        db: AsyncSession, scan_task: ScanTask) -> dict[str, str]:
+    """阶段1: Ping探测，发现存活主机。
+
+    分块策略:
+    - 将目标展开为IP列表，按 max_concurrent 分组
+    - standard: 每组IP合并为1次nmap调用（多IP合扫）
+    - ip_sequential: 每个IP单独1次nmap调用，Semaphore 控制并发数
+    - 单IP/小网段: 展开后只有1组，等同于一次性扫描
     """
-    await _append_log(db, scan_task, f"开始主机发现扫描, 目标: {targets}, 并发: {scan_task.max_concurrent or 4}")
-    max_concurrent = scan_task.max_concurrent or 4
     phase_errors: dict[str, str] = {}
-    total_phase_progress = 0
+
+    scanner_cls = SCANNER_REGISTRY.get("nmap_ping")
+    if not scanner_cls:
+        await _append_log(db, scan_task, "[阶段1/Ping探测] 扫描器未注册, 跳过")
+        return phase_errors
+
+    # 展开目标为IP列表
+    ip_list = _expand_targets_to_ips(targets)
+    if not ip_list:
+        await _append_log(db, scan_task, "[阶段1/Ping探测] 无有效目标")
+        return phase_errors
+
+    await _append_log(db, scan_task, f"[阶段1/Ping探测] 开始, {len(ip_list)} 个IP, 模式: {scan_mode}, 并发: {max_concurrent}")
+
+    if scan_mode == "ip_sequential":
+        # 逐IP策略: 每个IP单独1次nmap，Semaphore 控制并发
+        semaphore = asyncio.Semaphore(max_concurrent)
+        total = len(ip_list)
+        completed = 0
+
+        async def _ping_one(ip: str):
+            nonlocal completed
+            async with semaphore:
+                try:
+                    scanner = scanner_cls()
+                    results = await scanner.scan(
+                        ip, None,
+                        scan_method="nmap_ping", scan_mode=scan_mode,
+                        max_concurrent=1,
+                    )
+                    _merge_results(all_results, results)
+                    for r in results:
+                        r_ip = r.get("ip")
+                        if r_ip:
+                            await persist_host_incremental(db, scan_task_id, r_ip, r)
+                except Exception as e:
+                    phase_errors[f"ping_{ip}"] = str(e)
+                    logger.warning(f"Ping failed for {ip}: {e}")
+                completed += 1
+                if completed % max(1, total // 5) == 0 or completed == total:
+                    await _append_log(db, scan_task, f"[阶段1/Ping探测] 进度: {completed}/{total}")
+
+        tasks = [asyncio.create_task(_ping_one(ip)) for ip in ip_list]
+        await asyncio.gather(*tasks)
+    else:
+        # 标准策略: 按组并发，每组IP合并为1次nmap调用
+        ip_groups = _split_ips_into_groups(ip_list, max_concurrent)
+        total_groups = len(ip_groups)
+
+        for group_idx, ip_group in enumerate(ip_groups):
+            group_targets = " ".join(ip_group)
+            try:
+                scanner = scanner_cls()
+
+                async def _ping_progress(msg: str):
+                    await _append_log(db, scan_task, f"[Ping探测][组{group_idx + 1}] {msg}")
+
+                ping_results = await scanner.scan(
+                    group_targets, None,
+                    scan_method="nmap_ping", scan_mode=scan_mode,
+                    progress_callback=_ping_progress,
+                    max_concurrent=max_concurrent,
+                )
+                _merge_results(all_results, ping_results)
+                for r in ping_results:
+                    r_ip = r.get("ip")
+                    if r_ip:
+                        await persist_host_incremental(db, scan_task_id, r_ip, r)
+
+                group_alive = len(ping_results)
+                await _append_log(db, scan_task, f"[阶段1/Ping探测] 组 {group_idx + 1}/{total_groups} 完成: {group_alive} 个存活主机")
+            except Exception as e:
+                phase_errors[f"ping_group_{group_idx + 1}"] = str(e)
+                logger.warning(f"Ping group {group_idx + 1} failed: {e}")
+                await _append_log(db, scan_task, f"[阶段1/Ping探测] 组 {group_idx + 1}/{total_groups} 失败: {e}")
+
+    ping_hosts = len(all_results)
+    await _append_log(db, scan_task, f"[阶段1/Ping探测] 完成: 发现 {ping_hosts} 个存活主机")
+    return phase_errors
+
+
+# ========================================================================
+# 阶段2: Top1000端口发现（两种策略共用）
+# ========================================================================
+
+async def _phase2_top1000(targets: str, scan_mode: str, max_concurrent: int,
+                          scan_task_id: int, all_results: dict,
+                          db: AsyncSession, scan_task: ScanTask) -> dict[str, str]:
+    """阶段2: Top1000端口发现。
+
+    使用 nmap 原生 --top-ports 1000 参数（基于 nmap-services 频率数据），
+    跳过主机发现（阶段1已做），-sT TCP Connect。
+    skip_no_ports=True 过滤无开放端口的虚假存活主机。
+
+    分块策略:
+    - 将目标展开为IP列表，按 max_concurrent 分组
+    - standard: 每组IP合并为1次nmap调用（多IP合扫）
+    - ip_sequential: 每个IP单独1次nmap调用，Semaphore 控制并发数
+    - 单IP/小网段: 展开后只有1组，等同于一次性扫描
+    """
+    phase_errors: dict[str, str] = {}
+
+    scanner_cls = SCANNER_REGISTRY.get("nmap_syn")
+    if not scanner_cls:
+        await _append_log(db, scan_task, "[阶段2/Top1000端口发现] 扫描器未注册, 跳过")
+        return phase_errors
+
+    # 展开目标为IP列表
+    ip_list = _expand_targets_to_ips(targets)
+    if not ip_list:
+        await _append_log(db, scan_task, "[阶段2/Top1000端口发现] 无有效目标")
+        return phase_errors
+
+    await _append_log(db, scan_task, f"[阶段2/Top1000端口发现] 开始, {len(ip_list)} 个IP, --top-ports {settings.SCAN_TOP_PORTS}, 模式: {scan_mode}, 并发: {max_concurrent}")
+
+    if scan_mode == "ip_sequential":
+        # 逐IP策略: 每个IP单独1次nmap，Semaphore 控制并发
+        semaphore = asyncio.Semaphore(max_concurrent)
+        total = len(ip_list)
+        completed = 0
+
+        async def _top1000_one(ip: str):
+            nonlocal completed
+            async with semaphore:
+                try:
+                    scanner = scanner_cls()
+
+                    async def _ip_progress(msg: str):
+                        await _append_log(db, scan_task, f"[Top1000端口发现][{ip}] {msg}")
+
+                    results = await scanner.scan(
+                        ip, None,
+                        scan_method="nmap_syn", scan_mode=scan_mode,
+                        progress_callback=_ip_progress,
+                        max_concurrent=1,
+                        host_timeout=settings.SCAN_TOP_HOST_TIMEOUT_SEC,
+                        top_ports=settings.SCAN_TOP_PORTS,
+                    )
+                    _merge_results(all_results, results, skip_no_ports=True)
+                    for r in results:
+                        if not r.get("ports"):
+                            continue
+                        r_ip = r.get("ip")
+                        if r_ip:
+                            await persist_host_incremental(db, scan_task_id, r_ip, r)
+                except Exception as e:
+                    phase_errors[f"top1000_{ip}"] = str(e)
+                    logger.warning(f"Top1000 failed for {ip}: {e}")
+                completed += 1
+                if completed % max(1, total // 5) == 0 or completed == total:
+                    await _append_log(db, scan_task, f"[阶段2/Top1000端口发现] 进度: {completed}/{total}")
+
+        tasks = [asyncio.create_task(_top1000_one(ip)) for ip in ip_list]
+        await asyncio.gather(*tasks)
+    else:
+        # 标准策略: 按组并发，每组IP合并为1次nmap调用
+        ip_groups = _split_ips_into_groups(ip_list, max_concurrent)
+        total_groups = len(ip_groups)
+
+        for group_idx, ip_group in enumerate(ip_groups):
+            group_targets = " ".join(ip_group)
+            try:
+                scanner = scanner_cls()
+
+                async def _top1000_progress(msg: str):
+                    await _append_log(db, scan_task, f"[Top1000端口发现][组{group_idx + 1}] {msg}")
+
+                top1000_results = await scanner.scan(
+                    group_targets, None,
+                    scan_method="nmap_syn", scan_mode=scan_mode,
+                    progress_callback=_top1000_progress,
+                    max_concurrent=max_concurrent,
+                    host_timeout=settings.SCAN_TOP_HOST_TIMEOUT_SEC,
+                    top_ports=settings.SCAN_TOP_PORTS,
+                )
+                _merge_results(all_results, top1000_results, skip_no_ports=True)
+
+                for r in top1000_results:
+                    if not r.get("ports"):
+                        continue
+                    r_ip = r.get("ip")
+                    if r_ip:
+                        await persist_host_incremental(db, scan_task_id, r_ip, r)
+
+                group_alive = len([r for r in top1000_results if r.get("ports")])
+                group_ports = sum(len(r.get("ports", [])) for r in top1000_results)
+                await _append_log(db, scan_task, f"[阶段2/Top1000端口发现] 组 {group_idx + 1}/{total_groups} 完成: {group_alive} 个存活主机, {group_ports} 个开放端口")
+            except Exception as e:
+                phase_errors[f"top1000_group_{group_idx + 1}"] = str(e)
+                logger.warning(f"Top1000 group {group_idx + 1} failed: {e}")
+                await _append_log(db, scan_task, f"[阶段2/Top1000端口发现] 组 {group_idx + 1}/{total_groups} 失败: {e}")
+
+    top1000_hosts = len([r for r in all_results.values() if r.get("ports")])
+    top1000_ports = sum(len(r.get("ports", [])) for r in all_results.values())
+    await _append_log(db, scan_task, f"[阶段2/Top1000端口发现] 完成: 发现 {top1000_hosts} 个存活主机, {top1000_ports} 个开放端口")
+    return phase_errors
+
+
+# ========================================================================
+# 策略A: 标准扫描 — 按IP分块 + 按端口分块, 双维度并发
+# ========================================================================
+
+async def run_host_discovery(targets: str, scan_mode: str, ports: str | None,
+                              scan_task_id: int, all_results: dict,
+                              db: AsyncSession, scan_task: ScanTask):
+    """主机发现扫描（标准策略）：两阶段 Ping + Top1000。
+
+    - 阶段1: Ping探测 (0-30%)
+    - 阶段2: Top1000端口发现 (30-100%)
+    - 所有nmap操作使用 -sT (TCP Connect)，不需要root权限
+    - 阶段失败不影响后续，所有日志完全记录
+    """
+    max_concurrent = scan_task.max_concurrent or 4
+    await _append_log(db, scan_task, f"开始主机发现扫描(标准策略), 目标: {targets}, 并发: {max_concurrent}")
+    phase_errors: dict[str, str] = {}
 
     # ===== 阶段1: Ping探测 =====
-    try:
-        scanner_cls = SCANNER_REGISTRY.get("nmap_ping")
-        if scanner_cls:
-            scanner = scanner_cls()
-            async def _ping_progress(msg: str):
-                await _append_log(db, scan_task, f"[Ping探测] {msg}")
+    ping_errors = await _phase1_ping(targets, scan_mode, max_concurrent, scan_task_id, all_results, db, scan_task)
+    phase_errors.update(ping_errors)
 
-            await _append_log(db, scan_task, "[Ping探测] 开始")
-            ping_results = await scanner.scan(
-                targets, ports,
-                scan_method="nmap_ping", scan_mode=scan_mode,
-                progress_callback=_ping_progress,
-                max_concurrent=max_concurrent,
-            )
-            _merge_results(all_results, ping_results)
-            ping_hosts = len(ping_results)
-            await _append_log(db, scan_task, f"[Ping探测] 完成: 发现 {ping_hosts} 个存活主机")
-            for r in ping_results:
-                ip = r.get("ip")
-                if ip:
-                    await persist_host_incremental(db, scan_task_id, ip, r)
-        else:
-            await _append_log(db, scan_task, "[Ping探测] 扫描器未注册, 跳过")
-    except Exception as e:
-        phase_errors["nmap_ping"] = str(e)
-        logger.warning(f"Ping discovery failed for task {scan_task_id}: {e}")
-        await _append_log(db, scan_task, f"[Ping探测] 失败: {e}, 继续后续阶段")
+    await _update_progress(db, scan_task, PROGRESS_PHASE1_END, all_results)
+    yield PROGRESS_PHASE1_END, list(phase_errors.values()), []
 
-    total_phase_progress = PROGRESS_PING_END
-    scan_task.progress = total_phase_progress
-    from sqlalchemy.orm.attributes import flag_modified
-    flag_modified(scan_task, "scan_log")
-    scan_task.result_summary = {
-        "total_hosts": len(all_results),
-        "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
-    }
-    flag_modified(scan_task, "result_summary")
-    async with _db_lock:
-        await db.commit()
-    yield total_phase_progress, list(phase_errors.values()), []
+    # ===== 阶段2: Top1000端口发现 =====
+    top1000_errors = await _phase2_top1000(targets, scan_mode, max_concurrent, scan_task_id, all_results, db, scan_task)
+    phase_errors.update(top1000_errors)
 
-    # ===== 阶段2: ARP探测 =====
-    try:
-        scanner_cls = SCANNER_REGISTRY.get("nmap_arp")
-        if scanner_cls:
-            scanner = scanner_cls()
-            async def _arp_progress(msg: str):
-                await _append_log(db, scan_task, f"[ARP探测] {msg}")
-
-            await _append_log(db, scan_task, "[ARP探测] 开始")
-            arp_results = await scanner.scan(
-                targets, ports,
-                scan_method="nmap_arp", scan_mode=scan_mode,
-                progress_callback=_arp_progress,
-                max_concurrent=max_concurrent,
-            )
-            prev_count = len(all_results)
-            _merge_results(all_results, arp_results)
-            new_arp = len(all_results) - prev_count
-            arp_hosts = len(arp_results)
-            await _append_log(db, scan_task, f"[ARP探测] 完成: 发现 {arp_hosts} 个存活主机, 新增 {new_arp}")
-            for r in arp_results:
-                ip = r.get("ip")
-                if ip:
-                    await persist_host_incremental(db, scan_task_id, ip, r)
-        else:
-            await _append_log(db, scan_task, "[ARP探测] 扫描器未注册, 跳过")
-    except Exception as e:
-        phase_errors["nmap_arp"] = str(e)
-        logger.warning(f"ARP discovery failed for task {scan_task_id}: {e}")
-        await _append_log(db, scan_task, f"[ARP探测] 失败: {e}, 继续后续阶段")
-
-    total_phase_progress = PROGRESS_ARP_END
-    scan_task.progress = total_phase_progress
-    flag_modified(scan_task, "scan_log")
-    scan_task.result_summary = {
-        "total_hosts": len(all_results),
-        "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
-    }
-    flag_modified(scan_task, "result_summary")
-    async with _db_lock:
-        await db.commit()
-    yield total_phase_progress, list(phase_errors.values()), []
-
-    # ===== 阶段3: TCP端口扫描 (按端口块并发) =====
-    tcp_results = []
-    try:
-        scanner_cls = SCANNER_REGISTRY.get("nmap_syn")
-        if scanner_cls:
-            scanner = scanner_cls()
-
-            async def _tcp_progress(msg: str):
-                await _append_log(db, scan_task, f"[TCP端口扫描] {msg}")
-
-            await _append_log(db, scan_task, "[TCP端口扫描] 开始 (14个端口块并发)")
-            tcp_results = await scanner.scan(
-                targets, ports,
-                scan_method="nmap_syn", scan_mode=scan_mode,
-                progress_callback=_tcp_progress,
-                max_concurrent=max_concurrent,
-            )
-            _merge_results(all_results, tcp_results)
-            tcp_port_count = sum(len(r.get("ports", [])) for r in tcp_results)
-            await _append_log(db, scan_task, f"[TCP端口扫描] 完成: 发现 {tcp_port_count} 个开放端口")
-        else:
-            await _append_log(db, scan_task, "[TCP端口扫描] 扫描器未注册")
-    except Exception as e:
-        phase_errors["nmap_syn"] = str(e)
-        logger.warning(f"TCP port scan failed for task {scan_task_id}: {e}")
-        await _append_log(db, scan_task, f"[TCP端口扫描] 失败: {e}")
-
-    # 持久化最终结果
+    # 最终汇总
     new_results_data = []
     for r in all_results.values():
         ip = r.get("ip")
@@ -284,189 +421,43 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None, sc
             if persisted:
                 new_results_data.append(persisted)
 
-    errors = list(phase_errors.values())
     total_hosts = len(all_results)
     total_ports = sum(len(r.get("ports", [])) for r in all_results.values())
-
-    if "nmap_syn" in phase_errors and total_ports == 0 and total_hosts > 0:
-        await _append_log(db, scan_task, f"TCP端口扫描失败, 但Ping/ARP发现 {total_hosts} 个存活主机, 任务标记完成")
-    elif "nmap_syn" in phase_errors and total_hosts == 0:
-        await _append_log(db, scan_task, "所有扫描阶段均失败")
-    else:
-        await _append_log(db, scan_task, f"主机发现扫描完成: 共 {total_hosts} 主机, {total_ports} 开放端口")
+    await _append_log(db, scan_task, f"主机发现扫描完成(标准策略): 共 {total_hosts} 主机, {total_ports} 开放端口")
 
     progress = 100
-    yield progress, errors, new_results_data
+    yield progress, list(phase_errors.values()), new_results_data
 
 
-async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: str | None, scan_task_id: int, all_results: dict, db: AsyncSession, scan_task: ScanTask):
-    """主机发现扫描（逐IP分端口策略）：三阶段串行，阶段3多IP并发扫描。
+# ========================================================================
+# 策略B: 逐IP扫描 — 逐IP扫描 + 每IP内端口分块并发
+# ========================================================================
 
-    - 阶段1 Ping → 阶段2 ARP → 阶段3 逐IP分端口扫描
-    - 阶段3: 从targets展开所有IP，多个IP并发扫描
-    - max_concurrent 控制**同时扫描的IP数**（IP级 Semaphore）
-    - 每个IP内部按端口块并行扫描（创建独立的内部 Semaphore）
-    - 进度按IP数量划分: 阶段3进度 = 20 + (已完成IP数 / 总IP数) × 80
+async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: str | None,
+                                             scan_task_id: int, all_results: dict,
+                                             db: AsyncSession, scan_task: ScanTask):
+    """主机发现扫描（逐IP策略）：两阶段 Ping + Top1000。
+
+    - 阶段1: Ping探测 (0-30%)
+    - 阶段2: Top1000端口发现, 逐IP并发 (30-100%)
+    - 所有nmap操作使用 -sT (TCP Connect)，不需要root权限
     """
     max_concurrent = scan_task.max_concurrent or 4
     await _append_log(db, scan_task, f"开始主机发现扫描(逐IP策略), 目标: {targets}, 并发: {max_concurrent}")
     phase_errors: dict[str, str] = {}
 
     # ===== 阶段1: Ping探测 =====
-    try:
-        scanner_cls = SCANNER_REGISTRY.get("nmap_ping")
-        if scanner_cls:
-            scanner = scanner_cls()
-            async def _ping_progress(msg: str):
-                await _append_log(db, scan_task, f"[Ping探测] {msg}")
+    ping_errors = await _phase1_ping(targets, scan_mode, max_concurrent, scan_task_id, all_results, db, scan_task)
+    phase_errors.update(ping_errors)
 
-            await _append_log(db, scan_task, "[Ping探测] 开始")
-            ping_results = await scanner.scan(
-                targets, ports,
-                scan_method="nmap_ping", scan_mode=scan_mode,
-                progress_callback=_ping_progress,
-                max_concurrent=max_concurrent,
-            )
-            _merge_results(all_results, ping_results)
-            await _append_log(db, scan_task, f"[Ping探测] 完成: 发现 {len(ping_results)} 个存活主机")
-            for r in ping_results:
-                ip = r.get("ip")
-                if ip:
-                    await persist_host_incremental(db, scan_task_id, ip, r)
-        else:
-            await _append_log(db, scan_task, "[Ping探测] 扫描器未注册, 跳过")
-    except Exception as e:
-        phase_errors["nmap_ping"] = str(e)
-        logger.warning(f"Ping discovery failed for task {scan_task_id}: {e}")
-        await _append_log(db, scan_task, f"[Ping探测] 失败: {e}, 继续后续阶段")
+    await _update_progress(db, scan_task, PROGRESS_PHASE1_END, all_results)
+    yield PROGRESS_PHASE1_END, list(phase_errors.values()), []
 
-    scan_task.progress = PROGRESS_PING_END
-    from sqlalchemy.orm.attributes import flag_modified
-    flag_modified(scan_task, "scan_log")
-    scan_task.result_summary = {
-        "total_hosts": len(all_results),
-        "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
-    }
-    flag_modified(scan_task, "result_summary")
-    async with _db_lock:
-        await db.commit()
-    yield PROGRESS_PING_END, list(phase_errors.values()), []
+    # ===== 阶段2: Top1000端口发现 =====
+    top1000_errors = await _phase2_top1000(targets, scan_mode, max_concurrent, scan_task_id, all_results, db, scan_task)
+    phase_errors.update(top1000_errors)
 
-    # ===== 阶段2: ARP探测 =====
-    try:
-        scanner_cls = SCANNER_REGISTRY.get("nmap_arp")
-        if scanner_cls:
-            scanner = scanner_cls()
-            async def _arp_progress(msg: str):
-                await _append_log(db, scan_task, f"[ARP探测] {msg}")
-
-            await _append_log(db, scan_task, "[ARP探测] 开始")
-            arp_results = await scanner.scan(
-                targets, ports,
-                scan_method="nmap_arp", scan_mode=scan_mode,
-                progress_callback=_arp_progress,
-                max_concurrent=max_concurrent,
-            )
-            prev_count = len(all_results)
-            _merge_results(all_results, arp_results)
-            new_arp = len(all_results) - prev_count
-            await _append_log(db, scan_task, f"[ARP探测] 完成: 发现 {len(arp_results)} 个存活主机, 新增 {new_arp}")
-            for r in arp_results:
-                ip = r.get("ip")
-                if ip:
-                    await persist_host_incremental(db, scan_task_id, ip, r)
-        else:
-            await _append_log(db, scan_task, "[ARP探测] 扫描器未注册, 跳过")
-    except Exception as e:
-        phase_errors["nmap_arp"] = str(e)
-        logger.warning(f"ARP discovery failed for task {scan_task_id}: {e}")
-        await _append_log(db, scan_task, f"[ARP探测] 失败: {e}, 继续后续阶段")
-
-    scan_task.progress = PROGRESS_ARP_END
-    flag_modified(scan_task, "scan_log")
-    scan_task.result_summary = {
-        "total_hosts": len(all_results),
-        "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
-    }
-    flag_modified(scan_task, "result_summary")
-    async with _db_lock:
-        await db.commit()
-    yield PROGRESS_ARP_END, list(phase_errors.values()), []
-
-    # ===== 阶段3: 逐IP分端口扫描（IP级并发） =====
-    ip_list = _expand_targets_to_ips(targets)
-    total_ips = len(ip_list)
-    await _append_log(db, scan_task, f"[逐IP分端口扫描] 展开 {total_ips} 个IP地址, 同时扫描 {max_concurrent} 个IP")
-
-    scanner_cls = SCANNER_REGISTRY.get("nmap_syn")
-    if not scanner_cls:
-        await _append_log(db, scan_task, "[逐IP分端口扫描] 扫描器未注册")
-        progress = 100
-        yield progress, list(phase_errors.values()), []
-        return
-
-    completed_ips = 0
-    # IP级 Semaphore: 控制同时扫描的IP数量
-    # 每个IP内部由 scanner.scan() 自己创建内部 Semaphore 控制端口块并发
-    ip_semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def _scan_single_ip(ip_idx: int, ip_target: str):
-        """扫描单个IP的所有端口块，受 IP 级 Semaphore 约束。"""
-        nonlocal completed_ips
-        async with ip_semaphore:
-            await _append_log(db, scan_task, f"[逐IP分端口扫描] 开始扫描 IP {ip_idx + 1}/{total_ips}: {ip_target}")
-
-            ip_results = []
-            try:
-                # 每个IP创建独立的scanner实例（避免共享状态）
-                ip_scanner = scanner_cls()
-
-                async def _ip_tcp_progress(msg: str):
-                    await _append_log(db, scan_task, f"[TCP端口扫描][{ip_target}] {msg}")
-
-                # 不传 _global_semaphore：每个IP内部独立控制端口块并发
-                ip_results = await ip_scanner.scan(
-                    ip_target, ports,
-                    scan_method="nmap_syn", scan_mode=scan_mode,
-                    progress_callback=_ip_tcp_progress,
-                    max_concurrent=max_concurrent,
-                )
-                _merge_results(all_results, ip_results)
-                ip_port_count = sum(len(r.get("ports", [])) for r in ip_results)
-                await _append_log(db, scan_task, f"[逐IP分端口扫描] IP {ip_target} 完成: 发现 {ip_port_count} 个开放端口")
-            except Exception as e:
-                phase_errors[f"nmap_syn_{ip_target}"] = str(e)
-                logger.warning(f"TCP port scan failed for IP {ip_target} in task {scan_task_id}: {e}")
-                await _append_log(db, scan_task, f"[逐IP分端口扫描] IP {ip_target} 失败: {e}")
-
-            # 持久化该IP结果
-            for r in ip_results:
-                r_ip = r.get("ip")
-                if r_ip:
-                    await persist_host_incremental(db, scan_task_id, r_ip, r)
-
-            completed_ips += 1
-
-            # 计算进度: 阶段3进度 = 20 + (已完成IP数 / 总IP数) × 80
-            progress = int(PROGRESS_ARP_END + (completed_ips / total_ips) * 80) if total_ips > 0 else 100
-            async with _db_lock:
-                scan_task.progress = progress
-                flag_modified(scan_task, "scan_log")
-                scan_task.result_summary = {
-                    "total_hosts": len(all_results),
-                    "total_ports": sum(len(d.get("ports", [])) for d in all_results.values()),
-                }
-                flag_modified(scan_task, "result_summary")
-                await db.commit()
-
-    # 并发启动所有IP扫描任务（ip_semaphore 限制同时进行的IP数）
-    ip_tasks = [
-        asyncio.create_task(_scan_single_ip(ip_idx, ip_target))
-        for ip_idx, ip_target in enumerate(ip_list)
-    ]
-    await asyncio.gather(*ip_tasks)
-
-    # 最终持久化
+    # 最终汇总
     new_results_data = []
     for r in all_results.values():
         ip = r.get("ip")
@@ -475,18 +466,17 @@ async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: 
             if persisted:
                 new_results_data.append(persisted)
 
-    errors = list(phase_errors.values())
     total_hosts = len(all_results)
     total_ports = sum(len(r.get("ports", [])) for r in all_results.values())
-
-    if total_hosts > 0:
-        await _append_log(db, scan_task, f"逐IP扫描完成: 共 {total_hosts} 主机, {total_ports} 开放端口")
-    else:
-        await _append_log(db, scan_task, "所有扫描阶段均失败")
+    await _append_log(db, scan_task, f"主机发现扫描完成(逐IP策略): 共 {total_hosts} 主机, {total_ports} 开放端口")
 
     progress = 100
-    yield progress, errors, new_results_data
+    yield progress, list(phase_errors.values()), new_results_data
 
+
+# ========================================================================
+# 服务发现: 全端口分块扫描
+# ========================================================================
 
 async def run_chunked_full_scan(
     targets: str, scan_mode: str, scan_task_id: int,
@@ -555,7 +545,7 @@ async def run_chunked_full_scan(
                         if chunk.port_start <= p["port"] <= chunk.port_end:
                             chunk_open.append(p)
 
-            _merge_results(all_results, scan_results)
+            _merge_results(all_results, scan_results, skip_no_ports=True)
 
             for r in scan_results:
                 ip = r.get("ip")
@@ -621,7 +611,7 @@ async def run_scan_methods(targets: str, scan_mode: str, scan_methods: list, por
             if db and scan_task:
                 await _append_log(db, scan_task, f"开始执行扫描方法: {method}")
             scan_results = await scanner.scan(targets, ports, scan_method=method, scan_mode=scan_mode)
-            _merge_results(all_results, scan_results)
+            _merge_results(all_results, scan_results, skip_no_ports=True)
 
             if db and scan_task_id:
                 for r in scan_results:
@@ -650,10 +640,19 @@ async def run_scan_methods(targets: str, scan_mode: str, scan_methods: list, por
         yield progress, errors, new_results_data
 
 
-def _merge_results(all_results: dict, scan_results: list[dict]):
+def _merge_results(all_results: dict, scan_results: list[dict], skip_no_ports: bool = False):
+    """合并扫描结果到全局字典。
+
+    Args:
+        skip_no_ports: 为True时，跳过没有开放端口的主机。
+            用于TCP端口扫描阶段（-Pn模式下nmap会把所有目标标记为up，
+            但没有open端口的主机不应视为存活）。
+    """
     for r in scan_results:
         ip = r.get("ip")
         if not ip:
+            continue
+        if skip_no_ports and not r.get("ports"):
             continue
         if ip in all_results:
             existing = all_results[ip]

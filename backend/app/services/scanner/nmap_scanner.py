@@ -73,41 +73,64 @@ def _build_port_chunks(chunk_size: int = PORT_CHUNK_SIZE) -> list[tuple[int, int
     return chunks
 
 
-def _build_tcp_scan_args(ports: str | None = None) -> str:
-    """构建TCP端口扫描参数（-sT，不需要root），含超时优化。"""
+def _build_tcp_scan_args(
+    ports: str | None = None,
+    host_timeout: int | None = None,
+    top_ports: int | None = None,
+    max_retries: int | None = None,
+    min_rate: int | None = None,
+) -> str:
+    """构建TCP端口扫描参数（-sT，不需要root）。
+
+    Args:
+        ports: 端口范围，如 "1-5000"。None 表示全端口。
+        host_timeout: 单主机超时秒数。0=不超时，None 使用配置默认值。
+        top_ports: 使用 nmap 原生 --top-ports 参数扫描最常见的 N 个端口。
+            基于 nmap-services 频率数据，优先级高于 ports 参数。
+        max_retries: 无响应端口重传次数。None 使用配置默认值。
+        min_rate: 最低发包速率/秒。None 使用配置默认值。
+    """
     parts = ["-sT", "-T4"]
 
-    # 端口范围
-    if ports:
+    if top_ports:
+        parts.extend(["--top-ports", str(top_ports)])
+        host_timeout_val = host_timeout if host_timeout is not None else settings.SCAN_TOP_HOST_TIMEOUT_SEC
+        retries = max_retries if max_retries is not None else settings.SCAN_TOP_MAX_RETRIES
+        rate = min_rate if min_rate is not None else settings.SCAN_TOP_MIN_RATE
+    elif ports:
         parts.extend(["-p", ports])
+        host_timeout_val = host_timeout if host_timeout is not None else settings.SCAN_FULL_HOST_TIMEOUT_SEC
+        retries = max_retries if max_retries is not None else settings.SCAN_FULL_MAX_RETRIES
+        rate = min_rate if min_rate is not None else settings.SCAN_FULL_MIN_RATE
     else:
         parts.extend(["-p", "1-65535"])
+        host_timeout_val = host_timeout if host_timeout is not None else settings.SCAN_FULL_HOST_TIMEOUT_SEC
+        retries = max_retries if max_retries is not None else settings.SCAN_FULL_MAX_RETRIES
+        rate = min_rate if min_rate is not None else settings.SCAN_FULL_MIN_RATE
 
-    # 跳过主机发现（阶段1/2已完成）和DNS
     parts.extend(["-Pn", "-n"])
 
-    # 超时优化：减少无响应主机端口等待
-    parts.extend(["--max-retries", str(settings.SCAN_MAX_RETRIES)])
-    parts.extend(["--min-rate", str(settings.SCAN_MIN_RATE)])
-    parts.extend(["--host-timeout", f"{settings.SCAN_HOST_TIMEOUT_SEC}s"])
+    parts.extend(["--max-retries", str(retries)])
+    parts.extend(["--min-rate", str(rate)])
+    if host_timeout_val > 0:
+        parts.extend(["--host-timeout", f"{host_timeout_val}s"])
     parts.extend(["--max-rtt-timeout", f"{settings.SCAN_MAX_RTT_TIMEOUT_MS}ms"])
     parts.extend(["--initial-rtt-timeout", f"{settings.SCAN_INITIAL_RTT_TIMEOUT_MS}ms"])
     parts.extend(["--max-scan-delay", f"{settings.SCAN_MAX_SCAN_DELAY_MS}ms"])
 
-    # 进度输出
     parts.extend(["-v", "--reason"])
 
     return " ".join(parts)
 
 
 def _build_ping_args() -> str:
-    """构建Ping探测参数。"""
-    return "-sn -T4"
+    """构建Ping探测参数：-sn 只做主机发现，不扫端口。"""
+    return "-sn -T4 --max-rtt-timeout 500ms --initial-rtt-timeout 200ms"
 
 
 def _build_arp_args() -> str:
     """构建ARP探测参数。"""
-    return "-sn -PR -T4"
+    return "-sn -PR -T4 --max-rtt-timeout 500ms --initial-rtt-timeout 200ms"
 
 
 def _merge_results(all_results: dict, new_results: list[dict]):
@@ -161,64 +184,16 @@ class NmapScanner(BaseScanner):
 
         # 主机发现阶段3：TCP端口扫描，按端口块并发
         if progress_callback:
-            return await self._scan_port_chunked(targets, progress_callback, max_concurrent, _global_semaphore)
+            host_timeout = kwargs.get("host_timeout")
+            top_ports = kwargs.get("top_ports")
+            return await self._scan_port_chunked(targets, progress_callback, max_concurrent, _global_semaphore, host_timeout=host_timeout, top_ports=top_ports)
 
         # 无进度回调的回退
         args = _build_tcp_scan_args(ports)
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._run_nmap, targets, args)
 
-    # ----------------------------------------------------------------
-    # 并发上限计算
-    # ----------------------------------------------------------------
 
-    @staticmethod
-    def _calc_max_concurrent(
-        user_concurrent: int, target_hosts: int, chunk_ports: int = PORT_CHUNK_SIZE
-    ) -> int:
-        """根据系统资源动态计算安全并发上限。
-
-        nmap -sT 实际 fd 消耗（实测校准）:
-        - nmap 内部用 poll/select 调度并发连接，fd 被复用而非每连接独占
-        - 实测: 单个 nmap -sT 进程扫描 1~500 主机 × 5000 端口块，
-          峰值 fd 约为 50~100，与目标主机数弱相关（poll/select 复用）
-        - 每进程额外开销: stdout/stderr pipe + 临时文件 + 内部调度 ≈ 20 fd
-        - 因此: est_fds_per_proc ≈ 100（常数，覆盖最差情况）
-
-        校准记录:
-        - fd_limit=1024, 100主机: 旧模型 est=400→safe_fd=1; 新模型 est=100→safe_fd=7
-        - fd_limit=65535: safe_fd 充裕，由 CPU 和端口约束接管
-        """
-        import multiprocessing
-
-        cpu_count = multiprocessing.cpu_count()
-        try:
-            fd_limit = os.sysconf("SC_OPEN_MAX")
-        except (ValueError, OSError):
-            fd_limit = 1024
-
-        # 读取临时端口范围
-        local_ports = 28000
-        try:
-            with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
-                lo, hi = f.read().split()
-                local_ports = int(hi) - int(lo)
-        except Exception:
-            pass
-
-        # 基于实测: nmap -sT 使用 poll/select 复用 fd，单进程峰值约 50-100
-        # 附加 20 fd 用于 pipe/临时文件/内部调度，总计 ~120
-        est_fds_per_proc = 120
-
-        safe_by_fd = max(1, (fd_limit - 256) // est_fds_per_proc)
-        safe_by_cpu = max(1, cpu_count)
-        # 临时端口: nmap 复用已关闭的源端口，峰值连接约 300，共享源端口池
-        safe_by_port = max(1, local_ports // 300)
-
-        effective = min(user_concurrent, safe_by_fd, safe_by_cpu, safe_by_port, 16)
-        effective = max(1, effective)
-
-        return effective
 
     # ----------------------------------------------------------------
     # 阶段3：按端口块并发 + 实时进度（队列模式，兼容 Celery prefork）
@@ -227,6 +202,8 @@ class NmapScanner(BaseScanner):
     async def _scan_port_chunked(
         self, targets: str, progress_callback, max_concurrent: int = 4,
         _global_semaphore: asyncio.Semaphore | None = None,
+        host_timeout: int | None = None,
+        top_ports: int | None = None,
     ) -> list[dict]:
         """全端口TCP扫描：按端口块并发，失败自动重试。
 
@@ -236,11 +213,62 @@ class NmapScanner(BaseScanner):
         - 彻底解决 Celery prefork 下 asyncio.to_thread 的事件循环问题
 
         Args:
+            host_timeout: 单主机超时秒数。0=不超时，None=使用配置默认值。
+                当只扫描已确认存活的主机时，设为0避免误杀。
+            top_ports: 使用 nmap 原生 --top-ports N 参数，基于频率扫描最常见的 N 个端口。
+                设置后忽略端口分块，对每个目标做单次 --top-ports 扫描。
+
+        Args:
             _global_semaphore: 外部全局信号量，用于逐IP策略中多个IP共享
                 nmap 进程并发配额。如果提供，则不再创建内部信号量，
                 直接使用全局信号量控制端口块级并发。
         """
         target_list = _split_targets(targets)
+
+        # top_ports 快捷路径：使用 nmap 原生 --top-ports，不分端口块
+        if top_ports:
+            await progress_callback(
+                f"Top{top_ports}端口扫描: {len(target_list)} 个目标, --top-ports {top_ports}"
+            )
+            args = _build_tcp_scan_args(top_ports=top_ports, host_timeout=host_timeout)
+            nmap_path = settings.NMAP_PATH
+            cmd = [nmap_path] + shlex.split(args) + target_list
+
+            max_retries = settings.SCAN_CHUNK_MAX_RETRIES
+            for attempt in range(1, max_retries + 2):
+                xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_top_")
+                os.close(xml_fd)
+                cmd_with_xml = cmd + ["-oX", xml_path]
+                try:
+                    noop_queue: queue.Queue = queue.Queue()
+                    result = await asyncio.to_thread(
+                        self._run_nmap_sync,
+                        cmd_with_xml, xml_path, f"top{top_ports}",
+                        noop_queue, attempt, max_retries,
+                    )
+                    if result is not None:
+                        all_results = {}
+                        chunk_results, host_count, port_count = result
+                        _merge_results(all_results, chunk_results)
+                        total_hosts = len(all_results)
+                        total_ports = sum(len(r.get("ports", [])) for r in all_results.values())
+                        await progress_callback(
+                            f"Top{top_ports}端口扫描完成: {total_hosts} 个存活主机, {total_ports} 个开放端口"
+                        )
+                        return list(all_results.values())
+                    if attempt > max_retries:
+                        await progress_callback(f"Top{top_ports}端口扫描失败，重试次数用尽")
+                        return []
+                    await progress_callback(f"Top{top_ports}端口扫描失败，第{attempt}次重试...")
+                except Exception as e:
+                    if attempt > max_retries:
+                        await progress_callback(f"Top{top_ports}端口扫描异常: {e}")
+                        return []
+                finally:
+                    if os.path.exists(xml_path):
+                        os.unlink(xml_path)
+            return []
+
         port_chunks = _build_port_chunks()
         total = len(port_chunks)
 
@@ -252,15 +280,6 @@ class NmapScanner(BaseScanner):
             except ValueError:
                 est_hosts += 1
         est_hosts = max(est_hosts, 1)
-
-        # 动态计算安全并发上限
-        safe_concurrent = self._calc_max_concurrent(max_concurrent, est_hosts)
-        if safe_concurrent < max_concurrent:
-            await progress_callback(
-                f"并发上限调整: 用户设定 {max_concurrent} → 安全值 {safe_concurrent} "
-                f"(原因: {est_hosts} 目标主机, fd/CPU/端口约束)"
-            )
-        max_concurrent = safe_concurrent
 
         max_retries = settings.SCAN_CHUNK_MAX_RETRIES
         msg_queue: queue.Queue = queue.Queue()
@@ -283,7 +302,7 @@ class NmapScanner(BaseScanner):
             with active_lock:
                 active_workers += 1
             port_spec = f"{port_start}-{port_end}"
-            args = _build_tcp_scan_args(port_spec)
+            args = _build_tcp_scan_args(port_spec, host_timeout=host_timeout)
             nmap_path = settings.NMAP_PATH
             cmd = [nmap_path] + shlex.split(args) + target_list
 
@@ -409,6 +428,11 @@ class NmapScanner(BaseScanner):
 
         return list(all_results.values())
 
+    # 解析 "Discovered open port 25/tcp on 129.28.10.53" 格式
+    # nmap -v 可能输出: "Discovered open port 25/tcp on 129.28.10.53" 或
+    # "Discovered open port 25/tcp on 129.28.10.53 (12234)" (带反向DNS或进程信息)
+    _OPEN_PORT_RE = re.compile(r"^Discovered open port (\d+)/(tcp|udp) on (\S+?)(?:\s|$)")
+
     def _run_nmap_sync(
         self, cmd: list[str], xml_path: str, label: str,
         msg_queue: queue.Queue, attempt: int, max_retries: int
@@ -416,11 +440,18 @@ class NmapScanner(BaseScanner):
         """同步执行 nmap，通过 queue.Queue 发送进度消息。
 
         线程安全：不使用任何 asyncio API，不依赖事件循环。
+
+        当 nmap 因 --host-timeout 跳过主机时，XML 中不会包含已发现的端口，
+        但 stdout 实时输出了 "Discovered open port" 行。本方法会从 stdout
+        捕获这些端口信息，与 XML 解析结果合并，确保端口数据不丢失。
         """
         timeout_sec = settings.SCAN_HOST_DISCOVERY_TIMEOUT * 60
         host_count = 0
         port_count = 0
         last_progress_time = 0.0
+
+        # 从 stdout 实时捕获的端口发现: {ip: [{"port": int, "proto": str}, ...]}
+        stdout_ports: dict[str, list[dict]] = {}
 
         try:
             proc = subprocess.Popen(
@@ -447,6 +478,14 @@ class NmapScanner(BaseScanner):
                         host_count += 1
                     if line.startswith("Discovered open port"):
                         port_count += 1
+                        # 从 stdout 捕获端口发现信息（备份，防止 XML 因超时丢失）
+                        m = self._OPEN_PORT_RE.match(line)
+                        if m:
+                            p_port, p_proto, p_ip = int(m.group(1)), m.group(2), m.group(3)
+                            stdout_ports.setdefault(p_ip, []).append({
+                                "port": p_port, "proto": p_proto,
+                                "service": "", "version": "",
+                            })
 
                     # 进度行 → 放入队列（1秒节流）
                     if _PROGRESS_PATTERNS.search(line):
@@ -461,6 +500,38 @@ class NmapScanner(BaseScanner):
                 return None
 
             results = self._parse_xml_results(xml_path)
+
+            # 将 stdout 捕获的端口合并到 XML 解析结果中
+            # 当 --host-timeout 导致 XML 中缺少端口时，stdout 的端口发现是唯一的来源
+            if stdout_ports:
+                result_by_ip = {r["ip"]: r for r in results}
+                merged_count = 0
+                for ip, ports in stdout_ports.items():
+                    if ip in result_by_ip:
+                        existing = result_by_ip[ip]
+                        existing_port_keys = {
+                            f"{p['port']}/{p.get('proto', 'tcp')}"
+                            for p in (existing.get("ports") or [])
+                        }
+                        for p in ports:
+                            key = f"{p['port']}/{p.get('proto', 'tcp')}"
+                            if key not in existing_port_keys:
+                                existing.setdefault("ports", []).append(p)
+                                existing_port_keys.add(key)
+                                merged_count += 1
+                    else:
+                        # XML 中完全没有这个主机（超时被跳过），从 stdout 创建
+                        results.append({
+                            "ip": ip, "mac": None, "hostname": None,
+                            "os": None, "ports": ports,
+                        })
+                        merged_count += len(ports)
+                if merged_count > 0:
+                    logger.info(
+                        f"{label}: merged {merged_count} ports from stdout "
+                        f"into XML results (host-timeout recovery)"
+                    )
+
             return results, host_count, port_count
 
         except subprocess.TimeoutExpired:
@@ -478,16 +549,6 @@ class NmapScanner(BaseScanner):
     async def _scan_full_port_chunked(self, targets: str, ports: str | None, max_concurrent: int = 4, **kwargs) -> list[dict]:
         """服务发现全端口分块扫描，按端口块并发，支持 on_chunk_done 回调。"""
         target_list = _split_targets(targets)
-
-        # 估算目标主机数 + 智能并发上限
-        est_hosts = 0
-        for t in target_list:
-            try:
-                est_hosts += ipaddress.ip_network(t, strict=False).num_addresses - 2
-            except ValueError:
-                est_hosts += 1
-        est_hosts = max(est_hosts, 1)
-        max_concurrent = self._calc_max_concurrent(max_concurrent, est_hosts)
 
         semaphore = asyncio.Semaphore(max_concurrent)
         chunk_size = kwargs.get("chunk_size", settings.SCAN_CHUNK_SIZE)
@@ -630,15 +691,15 @@ class NmapScanner(BaseScanner):
     # 参数构建 & 同步 nmap 执行
     # ----------------------------------------------------------------
 
-    def _build_args(self, scan_method: str, scan_mode: str, ports: str | None) -> str:
+    def _build_args(self, scan_method: str, scan_mode: str, ports: str | None,
+                     top_ports: int | None = None, host_timeout: int | None = None) -> str:
         """构建nmap参数（所有扫描方式都不需要root权限）。"""
         if scan_method == "nmap_ping":
             return _build_ping_args()
         if scan_method == "nmap_arp":
             return _build_arp_args()
 
-        # TCP端口扫描（-sT，不需要root）
-        return _build_tcp_scan_args(ports)
+        return _build_tcp_scan_args(ports, host_timeout=host_timeout, top_ports=top_ports)
 
     def _run_nmap(self, targets: str, args: str) -> list[dict]:
         """同步执行nmap，解析结果。"""

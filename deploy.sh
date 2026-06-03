@@ -1,8 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  NetGuard v1.1.0 本地部署脚本（无 sudo，用户态运行）
+#  NetGuard v1.2.0 本地部署脚本（无 sudo，用户态运行）
 # ============================================================
-set -e
 
 # ---------- 颜色 ----------
 RED='\033[0;31m'
@@ -13,6 +12,7 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[✓]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 error() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+error_no_exit() { echo -e "${RED}[✗]${NC} $1"; }
 
 # ---------- 配置 ----------
 INSTALL_DIR="${INSTALL_DIR:-$HOME/code/netguard}"
@@ -20,6 +20,15 @@ REDIS_DIR="$INSTALL_DIR/local/redis"
 BACKEND_DIR="$INSTALL_DIR/backend"
 FRONTEND_DIR="$INSTALL_DIR/frontend"
 LOG_DIR="/tmp"
+
+# ---------- Redis 可执行文件路径 ----------
+REDIS_SERVER="$REDIS_DIR/usr/bin/redis-server"
+REDIS_CLI="$REDIS_DIR/usr/bin/redis-cli"
+REDIS_LIB_DIR="$REDIS_DIR/usr/lib/x86_64-linux-gnu"
+
+redis_cmd() {
+  LD_LIBRARY_PATH="$REDIS_LIB_DIR" "$REDIS_CLI" "$@"
+}
 
 # ============================================================
 #  帮助
@@ -72,7 +81,7 @@ wait_for() {
 # ============================================================
 do_install() {
   echo "=========================================="
-  echo "   NetGuard v1.1.0 首次安装"
+  echo "   NetGuard v1.2.0 首次安装"
   echo "=========================================="
 
   # ---- 1. 克隆代码 ----
@@ -95,15 +104,15 @@ do_install() {
   npm install
 
   # ---- 4. Redis（用户态安装）----
-  if [ -x "$REDIS_DIR/usr/bin/redis-server" ]; then
+  if [ -x "$REDIS_SERVER" ]; then
     info "Redis 已存在于 $REDIS_DIR"
   else
     info "安装 Redis（apt download，无需 sudo）..."
     mkdir -p "$REDIS_DIR"
     local tmpdir=$(mktemp -d)
     cd "$tmpdir"
-    apt download redis-server redis-tools liblzf1 2>/dev/null || 
-      apt-get download redis-server redis-tools liblzf1 2>/dev/null || 
+    apt download redis-server redis-tools liblzf1 2>/dev/null ||
+      apt-get download redis-server redis-tools liblzf1 2>/dev/null ||
       warn "apt download 失败，请手动安装 Redis"
     for deb in *.deb; do
       [ -f "$deb" ] && dpkg-deb -x "$deb" "$REDIS_DIR"
@@ -141,7 +150,7 @@ EOF
     echo ""
   fi
 
-  # ---- 6. nmap 权限 ----
+  # ---- 6. nmap ----
   if command -v nmap &>/dev/null; then
     info "nmap 已安装: $(which nmap)"
   else
@@ -163,20 +172,27 @@ do_start() {
   source_env
 
   # ---- Redis ----
-  if [ "$(check_port 6379)" = "used" ]; then
+  if redis_cmd -p 6379 ping &>/dev/null; then
     info "Redis 已运行"
   else
     info "启动 Redis..."
-    if [ ! -x "$REDIS_DIR/usr/bin/redis-server" ]; then
+    if [ ! -x "$REDIS_SERVER" ]; then
       error "Redis 未安装，运行 $0 install"
     fi
-    LD_LIBRARY_PATH="$REDIS_DIR/usr/lib/x86_64-linux-gnu" "$REDIS_DIR/usr/bin/redis-server" --port 6379 --dir /tmp --daemonize yes
+    LD_LIBRARY_PATH="$REDIS_LIB_DIR" "$REDIS_SERVER" --port 6379 --dir /tmp --daemonize yes
     sleep 1
-    if [ "$(check_port 6379)" = "used" ]; then
+    if redis_cmd -p 6379 ping &>/dev/null; then
       info "Redis 启动成功"
     else
       error "Redis 启动失败"
     fi
+  fi
+
+  # ---- nmap ----
+  if command -v nmap &>/dev/null; then
+    info "nmap 已就绪: $(nmap --version 2>/dev/null | head -1)"
+  else
+    warn "nmap 未安装，扫描功能不可用: sudo apt install nmap"
   fi
 
   # ---- 后端 ----
@@ -184,8 +200,8 @@ do_start() {
     info "后端已运行"
   else
     info "启动后端..."
-    nohup .venv/bin/uvicorn app.main:app 
-      --host 127.0.0.1 --port 8000 
+    nohup .venv/bin/uvicorn app.main:app \
+      --host 0.0.0.0 --port 8000 \
       > "$LOG_DIR/netguard-uvicorn.log" 2>&1 &
     if wait_for "http://127.0.0.1:8000/api/health" "ok" 15; then
       info "后端启动成功"
@@ -199,12 +215,11 @@ do_start() {
     info "Celery 已运行"
   else
     info "启动 Celery Worker..."
-    nohup .venv/bin/celery -A app.tasks.celery_app worker --loglevel=info 
+    nohup .venv/bin/celery -A app.tasks.celery_app worker --loglevel=info \
       > "$LOG_DIR/netguard-celery.log" 2>&1 &
     sleep 3
     if pgrep -f "celery -A app.tasks" &>/dev/null; then
       info "Celery 启动成功"
-      # 验证任务注册
       if grep -q "run_scan_task" "$LOG_DIR/netguard-celery.log" 2>/dev/null; then
         info "Celery 任务已注册: run_scan_task"
       else
@@ -221,9 +236,9 @@ do_start() {
   else
     info "启动前端..."
     cd "$FRONTEND_DIR"
-    nohup npx vite --host 127.0.0.1 
+    nohup npx vite --host 0.0.0.0 \
       > "$LOG_DIR/netguard-frontend.log" 2>&1 &
-    if wait_for "http://127.0.0.1:5173/" "" 15; then
+    if wait_for "http://127.0.0.1:5173/" "<!doctype" 15; then
       info "前端启动成功"
     else
       error "前端启动失败，查看日志: tail $LOG_DIR/netguard-frontend.log"
@@ -246,18 +261,39 @@ do_stop() {
   echo "停止 NetGuard 服务..."
 
   # 前端
-  pkill -f "node.*vite" 2>/dev/null && info "前端已停止" || warn "前端未运行"
+  if pgrep -f "node.*vite" &>/dev/null; then
+    pkill -f "node.*vite" 2>/dev/null
+    sleep 1
+    pgrep -f "node.*vite" &>/dev/null && pkill -9 -f "node.*vite" 2>/dev/null
+    info "前端已停止"
+  else
+    warn "前端未运行"
+  fi
 
-  # Celery
-  pkill -f "celery -A app.tasks" 2>/dev/null && info "Celery 已停止" || warn "Celery 未运行"
+  # Celery（杀主进程及子进程）
+  if pgrep -f "celery -A app.tasks" &>/dev/null; then
+    pkill -f "celery -A app.tasks" 2>/dev/null
+    sleep 2
+    pgrep -f "celery -A app.tasks" &>/dev/null && pkill -9 -f "celery -A app.tasks" 2>/dev/null
+    info "Celery 已停止"
+  else
+    warn "Celery 未运行"
+  fi
 
-  # 后端
-  pkill -f "uvicorn app.main:app" 2>/dev/null && info "后端已停止" || warn "后端未运行"
+  # 后端（杀 uvicorn 主进程及 reload 子进程）
+  if pgrep -f "uvicorn app.main" &>/dev/null; then
+    pkill -f "uvicorn app.main" 2>/dev/null
+    sleep 1
+    pgrep -f "uvicorn app.main" &>/dev/null && pkill -9 -f "uvicorn app.main" 2>/dev/null
+    info "后端已停止"
+  else
+    warn "后端未运行"
+  fi
 
   # Redis
-  if [ "$(check_port 6379)" = "used" ]; then
-    redis-cli -p 6379 shutdown nosave 2>/dev/null && info "Redis 已停止" || 
-      pkill -f "redis-server.*6379" 2>/dev/null && info "Redis 已停止"
+  if redis_cmd -p 6379 ping &>/dev/null; then
+    redis_cmd -p 6379 shutdown nosave 2>/dev/null || pkill -f "redis-server.*6379" 2>/dev/null
+    info "Redis 已停止"
   else
     warn "Redis 未运行"
   fi
@@ -281,12 +317,10 @@ do_status() {
   echo "=========================================="
 
   # Redis
-  if [ "$(check_port 6379)" = "used" ]; then
+  if redis_cmd -p 6379 ping &>/dev/null; then
     info "Redis       :6379  运行中"
   else
-    error_no_exit=true
-    echo -e "${RED}[✗]${NC} Redis       :6379  未运行"
-    unset error_no_exit
+    error_no_exit "Redis       :6379  未运行"
   fi
 
   # 后端
@@ -295,7 +329,7 @@ do_status() {
     ver=$(echo "$health" | python3 -c "import json,sys; print(json.load(sys.stdin).get('version','?'))" 2>/dev/null)
     info "后端        :8000  运行中 v${ver:-?}"
   else
-    echo -e "${RED}[✗]${NC} 后端        :8000  未运行"
+    error_no_exit "后端        :8000  未运行"
   fi
 
   # Celery
@@ -303,14 +337,22 @@ do_status() {
     cnt=$(pgrep -f "celery -A app.tasks" | wc -l)
     info "Celery      worker ${cnt} 进程"
   else
-    echo -e "${RED}[✗]${NC} Celery      未运行"
+    error_no_exit "Celery      未运行"
+  fi
+
+  # nmap
+  if command -v nmap &>/dev/null; then
+    nmap_ver=$(nmap --version 2>/dev/null | grep "^Nmap version" | awk '{print $3}')
+    info "nmap        v${nmap_ver:-?}  可用"
+  else
+    error_no_exit "nmap        未安装"
   fi
 
   # 前端
   if [ "$(check_port 5173)" = "used" ]; then
     info "前端        :5173  运行中"
   else
-    echo -e "${RED}[✗]${NC} 前端        :5173  未运行"
+    error_no_exit "前端        :5173  未运行"
   fi
 }
 
@@ -322,30 +364,25 @@ do_update() {
   echo "   NetGuard 更新部署"
   echo "=========================================="
 
-  # 停服务
   do_stop
   sleep 2
 
-  # 拉代码
   info "拉取最新代码..."
   cd "$INSTALL_DIR"
   git pull origin main
 
-  # 后端依赖
   if git diff --name-only HEAD@{1} HEAD | grep -q "requirements.txt"; then
     info "更新后端依赖..."
     cd "$BACKEND_DIR"
     .venv/bin/pip install -r requirements.txt -q
   fi
 
-  # 前端依赖
   if git diff --name-only HEAD@{1} HEAD | grep -q "package.json"; then
     info "更新前端依赖..."
     cd "$FRONTEND_DIR"
     npm install
   fi
 
-  # 启动
   do_start
 }
 
