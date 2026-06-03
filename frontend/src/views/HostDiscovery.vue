@@ -37,12 +37,16 @@
         </el-form-item>
         <el-form-item label="扫描策略" prop="scan_mode">
           <el-radio-group v-model="scanForm.scan_mode">
-            <el-radio-button value="standard">分块并行扫描</el-radio-button>
-            <el-radio-button value="ip_sequential">逐IP分端口扫描</el-radio-button>
+            <el-tooltip content="多IP合并为一次nmap调用扫描，效率最高，日常推荐" placement="top">
+              <el-radio-button value="standard">合并扫描</el-radio-button>
+            </el-tooltip>
+            <el-tooltip content="每个IP单独扫描，按IP分配进度，适合大网段扫描" placement="top">
+              <el-radio-button value="ip_sequential">逐IP扫描</el-radio-button>
+            </el-tooltip>
           </el-radio-group>
           <div style="margin-top:4px;color:#909399;font-size:12px">
-            <span v-if="scanForm.scan_mode === 'standard'">所有IP同时扫描，按端口块(5000/块)并行</span>
-            <span v-else>多IP并发扫描，每个IP按端口块(5000/块)并行</span>
+            <span v-if="scanForm.scan_mode === 'standard'">多IP合并为一次nmap调用，分组依次执行</span>
+            <span v-else>每个IP单独扫描，多IP并发执行</span>
           </div>
         </el-form-item>
         <el-form-item label="发现方法">
@@ -50,7 +54,7 @@
         </el-form-item>
         <el-form-item label="并发数">
           <el-slider v-model="scanForm.max_concurrent" :min="1" :max="16" :step="1" show-stops :marks="{ 1:'1', 4:'4(默认)', 8:'8', 16:'16(最大)' }" style="width:300px" />
-          <span style="margin-left:12px;color:#909399;font-size:12px">同时运行的 nmap 进程数，越大越快但更占资源</span>
+          <span style="margin-left:12px;color:#909399;font-size:12px">合并扫描时为每组IP数；逐IP扫描时为最大并发进程数</span>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="submitting" @click="handleSubmit">开始发现</el-button>

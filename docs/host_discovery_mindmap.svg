@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1147" height="2094" viewBox="0 0 1147 2094" style="font-family: system-ui, sans-serif;">
+<rect width="100%" height="100%" fill="#fafafa" rx="8"/>
+<rect x="0" y="4" width="64.8" height="24" fill="#2c3e50" rx="6" ry="6"/>
+<text x="10" y="20" fill="white" font-size="16" font-weight="bold">主机发现</text>
+<text x="220" y="46" fill="#2980b9" font-size="13">● 前端 UI</text>
+<text x="440" y="72" fill="#27ae60" font-size="12">● 表单字段</text>
+<text x="660" y="98" fill="#e67e22" font-size="11">▸ 任务名称</text>
+<text x="660" y="124" fill="#e67e22" font-size="11">▸ 扫描目标 (IP/CIDR/域名)</text>
+<text x="660" y="150" fill="#e67e22" font-size="11">▸ 扫描类型 (一次性/周期)</text>
+<text x="660" y="176" fill="#e67e22" font-size="11">▸ 扫描策略</text>
+<text x="880" y="202" fill="#8e44ad" font-size="11">▸ standard: 分块并行扫描</text>
+<text x="880" y="228" fill="#8e44ad" font-size="11">▸ ip_sequential: 逐IP分端口扫描</text>
+<text x="660" y="254" fill="#e67e22" font-size="11">▸ 发现方法: Ping探测→Top1000</text>
+<text x="660" y="280" fill="#e67e22" font-size="11">▸ 并发数 (1-16 滑块)</text>
+<text x="440" y="306" fill="#27ae60" font-size="12">● 提交 payload</text>
+<text x="660" y="332" fill="#e67e22" font-size="11">▸ name / targets / scan_type</text>
+<text x="660" y="358" fill="#e67e22" font-size="11">▸ scan_mode / max_concurrent</text>
+<text x="660" y="384" fill="#e67e22" font-size="11">▸ scan_category: host_discovery</text>
+<text x="660" y="410" fill="#c0392b" font-size="11" font-weight="bold">❌ 无 scan_methods</text>
+<text x="220" y="436" fill="#2980b9" font-size="13">● 后端 API</text>
+<text x="440" y="462" fill="#27ae60" font-size="12">● POST /api/host-scans/</text>
+<text x="660" y="488" fill="#e67e22" font-size="11">▸ scan_methods 存空列表</text>
+<text x="660" y="514" fill="#e67e22" font-size="11">▸ 调度 _dispatch_scan</text>
+<text x="440" y="540" fill="#27ae60" font-size="12">● _dispatch_scan</text>
+<text x="660" y="566" fill="#e67e22" font-size="11">▸ 优先 Celery: run_scan_task.delay(id, targets, scan_mode, ports)</text>
+<text x="660" y="592" fill="#e67e22" font-size="11">▸ 回退 asyncio: execute_scan(task_id)</text>
+<text x="220" y="618" fill="#2980b9" font-size="13">● 执行器 scan_executor</text>
+<text x="440" y="644" fill="#27ae60" font-size="12">● execute_scan</text>
+<text x="660" y="670" fill="#e67e22" font-size="11">▸ 读 scan_category 判断主机发现</text>
+<text x="660" y="696" fill="#e67e22" font-size="11">▸ 统一调用 run_host_discovery</text>
+<text x="440" y="722" fill="#27ae60" font-size="12">● run_host_discovery</text>
+<text x="660" y="748" fill="#e67e22" font-size="11">▸ 阶段1: _phase1_ping</text>
+<text x="660" y="774" fill="#e67e22" font-size="11">▸ 阶段2: _phase2_top1000</text>
+<text x="440" y="800" fill="#27ae60" font-size="12">● _phase1_ping (nmap_ping)</text>
+<text x="660" y="826" fill="#e67e22" font-size="11">▸ 展开 IP 列表</text>
+<text x="660" y="852" fill="#e67e22" font-size="11">▸ standard: 分组串行</text>
+<text x="880" y="878" fill="#8e44ad" font-size="11">▸ 每组 max_concurrent 个IP</text>
+<text x="880" y="904" fill="#8e44ad" font-size="11">▸ 合并为1次 nmap 调用</text>
+<text x="880" y="930" fill="#c0392b" font-size="11" font-weight="bold">⚠️ 组间串行执行</text>
+<text x="660" y="956" fill="#e67e22" font-size="11">▸ ip_sequential: 逐IP并发</text>
+<text x="880" y="982" fill="#8e44ad" font-size="11">▸ Semaphore(max_concurrent)</text>
+<text x="880" y="1008" fill="#8e44ad" font-size="11">▸ 每IP单独1次 nmap</text>
+<text x="880" y="1034" fill="#8e44ad" font-size="11">▸ IP间并行执行</text>
+<text x="440" y="1060" fill="#27ae60" font-size="12">● _phase2_top1000 (nmap_syn)</text>
+<text x="660" y="1086" fill="#e67e22" font-size="11">▸ 传 top_ports=1000</text>
+<text x="660" y="1112" fill="#e67e22" font-size="11">▸ 跳过无端口主机 skip_no_ports=True</text>
+<text x="660" y="1138" fill="#e67e22" font-size="11">▸ standard: 分组串行</text>
+<text x="880" y="1164" fill="#8e44ad" font-size="11">▸ 同阶段1分组策略</text>
+<text x="660" y="1190" fill="#e67e22" font-size="11">▸ ip_sequential: 逐IP并发</text>
+<text x="880" y="1216" fill="#8e44ad" font-size="11">▸ 同阶段1逐IP策略</text>
+<text x="220" y="1242" fill="#2980b9" font-size="13">● 扫描器 NmapScanner</text>
+<text x="440" y="1268" fill="#27ae60" font-size="12">● scan() 入口分派</text>
+<text x="660" y="1294" fill="#e67e22" font-size="11">▸ nmap_ping → _build_ping_args → 同步执行</text>
+<text x="660" y="1320" fill="#e67e22" font-size="11">▸ nmap_syn + top_ports → top_ports 快捷路径</text>
+<text x="660" y="1346" fill="#e67e22" font-size="11">▸ nmap_syn_full → 全端口分块扫描 (服务发现用)</text>
+<text x="440" y="1372" fill="#27ae60" font-size="12">● 最终 nmap 命令</text>
+<text x="660" y="1398" fill="#e67e22" font-size="11">▸ 阶段1 Ping</text>
+<text x="880" y="1424" fill="#8e44ad" font-size="11">▸ nmap -sn -T4</text>
+<text x="880" y="1450" fill="#8e44ad" font-size="11">▸ --max-rtt-timeout 500ms</text>
+<text x="880" y="1476" fill="#8e44ad" font-size="11">▸ --initial-rtt-timeout 200ms</text>
+<text x="880" y="1502" fill="#8e44ad" font-size="11">▸ TARGET</text>
+<text x="660" y="1528" fill="#e67e22" font-size="11">▸ 阶段2 Top1000</text>
+<text x="880" y="1554" fill="#8e44ad" font-size="11">▸ nmap -sT -T4 --top-ports 1000</text>
+<text x="880" y="1580" fill="#8e44ad" font-size="11">▸ -Pn -n --max-retries 2</text>
+<text x="880" y="1606" fill="#8e44ad" font-size="11">▸ --min-rate 500</text>
+<text x="880" y="1632" fill="#8e44ad" font-size="11">▸ --host-timeout 60s</text>
+<text x="880" y="1658" fill="#8e44ad" font-size="11">▸ -v --reason TARGET</text>
+<text x="220" y="1684" fill="#c0392b" font-size="13" font-weight="bold">❌ 前后端不一致</text>
+<text x="440" y="1710" fill="#27ae60" font-size="12">● 策略描述不准</text>
+<text x="660" y="1736" fill="#e67e22" font-size="11">▸ standard 描述</text>
+<text x="880" y="1762" fill="#8e44ad" font-size="11">▸ 前端: 所有IP同时扫描，按端口块(5000/块)并行</text>
+<text x="880" y="1788" fill="#8e44ad" font-size="11">▸ 实际: 分组串行，不分端口块</text>
+<text x="660" y="1814" fill="#e67e22" font-size="11">▸ ip_sequential 描述</text>
+<text x="880" y="1840" fill="#8e44ad" font-size="11">▸ 前端: 多IP并发，每个IP按端口块(5000/块)并行</text>
+<text x="880" y="1866" fill="#8e44ad" font-size="11">▸ 实际: 不分端口块，走 top_ports 路径</text>
+<text x="440" y="1892" fill="#27ae60" font-size="12">● 并发数语义</text>
+<text x="660" y="1918" fill="#e67e22" font-size="11">▸ 前端: 同时运行的nmap进程数</text>
+<text x="660" y="1944" fill="#e67e22" font-size="11">▸ standard实际: 每组IP数，组间串行</text>
+<text x="660" y="1970" fill="#e67e22" font-size="11">▸ ip_sequential实际: Semaphore限制，并发正确 ✅</text>
+<text x="440" y="1996" fill="#27ae60" font-size="12">● 端口块5000概念</text>
+<text x="660" y="2022" fill="#e67e22" font-size="11">▸ 仅在全端口扫描(nmap_syn_full)生效</text>
+<text x="660" y="2048" fill="#e67e22" font-size="11">▸ 主机发现不涉及，应从描述中移除</text>
+</svg>
