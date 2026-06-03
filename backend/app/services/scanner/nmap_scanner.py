@@ -43,15 +43,14 @@ def _split_targets(targets: str) -> list[str]:
 
 
 METHOD_ARGS = {
-    "nmap_syn": ["-sT"],          # 统一使用 -sT (TCP Connect), 不需要root
-    "nmap_connect": ["-sT"],
-    "nmap_udp": ["-sT"],          # 不用 -sU (需root), 退化为TCP探测
-    "nmap_service": ["-sV"],
-    "nmap_os": ["-sV"],           # 不用 -O (需root), 用 -sV 间接获取
-    "nmap_script": ["-sC"],
-    "nmap_ping": ["-sn"],
-    "nmap_arp": ["-sn", "-PR"],
-    "nmap_syn_full": ["-sT"],     # 统一使用 -sT
+    # 注意: nmap_syn 名称暗示 SYN 扫描(-sS)，但实际使用 TCP Connect(-sT)，
+    # 因为 SYN 扫描需要 root 权限。保留名称仅为向后兼容已有数据库记录。
+    "nmap_syn": ["-sT"],          # TCP Connect, 不需要root (命名历史遗留)
+    "nmap_connect": ["-sT"],      # 同 nmap_syn，兼容旧数据
+    "nmap_service": ["-sV"],      # 服务版本识别
+    "nmap_script": ["-sC"],       # 脚本扫描
+    "nmap_ping": ["-sn"],         # Ping 主机发现
+    "nmap_syn_full": ["-sT"],     # TCP Connect 全端口
 }
 
 _PROGRESS_PATTERNS = re.compile(
@@ -128,11 +127,6 @@ def _build_ping_args() -> str:
     return "-sn -T4 --max-rtt-timeout 500ms --initial-rtt-timeout 200ms"
 
 
-def _build_arp_args() -> str:
-    """构建ARP探测参数。"""
-    return "-sn -PR -T4 --max-rtt-timeout 500ms --initial-rtt-timeout 200ms"
-
-
 def _merge_results(all_results: dict, new_results: list[dict]):
     """合并扫描结果，同 IP 的端口去重，缺失字段从新结果补充。"""
     for r in new_results:
@@ -168,16 +162,13 @@ class NmapScanner(BaseScanner):
         # 外部全局信号量：用于逐IP策略中跨IP共享 nmap 进程并发配额
         _global_semaphore = kwargs.get("_global_semaphore")
 
-        # Ping/ARP：简单快速扫描，用线程池
-        if scan_method in ("nmap_ping", "nmap_arp"):
-            if scan_method == "nmap_ping":
-                args = _build_ping_args()
-            else:
-                args = _build_arp_args()
+        # Ping：简单快速扫描，用线程池
+        if scan_method == "nmap_ping":
+            args = _build_ping_args()
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, self._run_nmap, targets, args)
 
-        # TCP端口扫描（主机发现阶段3 / 服务发现）
+        # TCP端口扫描（主机发现阶段2 / 服务发现）
         if scan_method == "nmap_syn_full":
             # 服务发现：全端口分块扫描
             return await self._scan_full_port_chunked(targets, ports, max_concurrent=max_concurrent, **kwargs)
@@ -696,8 +687,6 @@ class NmapScanner(BaseScanner):
         """构建nmap参数（所有扫描方式都不需要root权限）。"""
         if scan_method == "nmap_ping":
             return _build_ping_args()
-        if scan_method == "nmap_arp":
-            return _build_arp_args()
 
         return _build_tcp_scan_args(ports, host_timeout=host_timeout, top_ports=top_ports)
 

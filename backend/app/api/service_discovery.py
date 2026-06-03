@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/service-scans", tags=["服务发现"])
 
-SERVICE_METHODS = {ScanMethod.nmap_syn, ScanMethod.nmap_syn_full, ScanMethod.nmap_connect, ScanMethod.nmap_udp, ScanMethod.nmap_service, ScanMethod.nmap_os, ScanMethod.nmap_script}
+SERVICE_METHODS = {ScanMethod.nmap_syn, ScanMethod.nmap_syn_full, ScanMethod.nmap_connect, ScanMethod.nmap_service, ScanMethod.nmap_script}
 
 
 async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):

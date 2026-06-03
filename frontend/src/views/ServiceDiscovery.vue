@@ -34,44 +34,21 @@
         </el-form-item>
         <el-form-item label="扫描模式" prop="scan_mode">
           <el-radio-group v-model="scanForm.scan_mode">
-            <el-tooltip content="仅扫描常见Top1000端口，速度最快，适合快速摸底" placement="top">
-              <el-radio-button value="quick">快速扫描</el-radio-button>
-            </el-tooltip>
-            <el-tooltip content="扫描所有指定端口+服务识别，平衡速度与精度，日常推荐" placement="top">
+            <el-tooltip content="多IP合并为一次nmap调用扫描，效率最高，日常推荐" placement="top">
               <el-radio-button value="standard">标准扫描</el-radio-button>
             </el-tooltip>
-            <el-tooltip content="T2时序，扫描间隔400ms，每秒最多50包，约5-10倍标准时间" placement="top">
-              <el-radio-button value="stealth_light">隐蔽-轻度</el-radio-button>
-            </el-tooltip>
-            <el-tooltip content="T1时序，扫描间隔3s，每秒最多10包，报文分片+随机化，约20-50倍标准时间" placement="top">
-              <el-radio-button value="stealth_medium">隐蔽-中度</el-radio-button>
-            </el-tooltip>
-            <el-tooltip content="T0时序，扫描间隔10s，每秒最多5包，分片+诱饵+源端口伪造，可能需要数小时" placement="top">
-              <el-radio-button value="stealth_deep">隐蔽-深度</el-radio-button>
-            </el-tooltip>
-            <el-tooltip content="手动指定所有扫描参数" placement="top">
-              <el-radio-button value="custom">自定义</el-radio-button>
+            <el-tooltip content="每个IP单独扫描，按IP分配进度，适合大网段扫描" placement="top">
+              <el-radio-button value="ip_sequential">逐IP扫描</el-radio-button>
             </el-tooltip>
           </el-radio-group>
         </el-form-item>
-        <el-alert v-if="scanForm.scan_mode && scanForm.scan_mode.startsWith('stealth')" type="warning" :closable="false" style="margin-bottom:16px">
-          <template v-if="scanForm.scan_mode==='stealth_light'">隐蔽-轻度：扫描间隔400ms，速率上限50包/秒，约需标准扫描5-10倍时间。可绕过基础防火墙检测。</template>
-          <template v-else-if="scanForm.scan_mode==='stealth_medium'">隐蔽-中度：扫描间隔3秒，速率上限10包/秒，启用报文分片+主机随机化。约需20-50倍时间。可绕过多数IDS/防火墙。</template>
-          <template v-else-if="scanForm.scan_mode==='stealth_deep'">隐蔽-深度：扫描间隔10秒，速率上限5包/秒，启用分片+诱饵主机+源端口53伪造+随机填充。可能需要数小时。用于高安全目标。</template>
-        </el-alert>
         <el-form-item label="端口扫描" prop="port_scan_method">
           <el-radio-group v-model="scanForm.port_scan_method">
-            <el-tooltip content="SYN全端口分块扫描(1-65535)，每块独立保存可恢复，充足重传防丢包漏报，推荐" placement="top">
-              <el-radio-button value="nmap_syn_full">SYN全端口扫描</el-radio-button>
+            <el-tooltip content="TCP全端口分块扫描(1-65535)，每块独立保存可恢复，推荐" placement="top">
+              <el-radio-button value="nmap_syn_full">全端口扫描</el-radio-button>
             </el-tooltip>
-            <el-tooltip content="TCP SYN半开扫描，速度快且隐蔽，不完成完整握手（nmap需root，内置扫描器自动降级为全连接）" placement="top">
-              <el-radio-button value="nmap_syn">SYN扫描</el-radio-button>
-            </el-tooltip>
-            <el-tooltip content="TCP全连接扫描，完成完整三次握手，最可靠，无需root权限" placement="top">
-              <el-radio-button value="nmap_connect">全连接扫描</el-radio-button>
-            </el-tooltip>
-            <el-tooltip content="UDP端口扫描，速度慢，用于发现DNS(53)/SNMP(161)等UDP服务" placement="top">
-              <el-radio-button value="nmap_udp">UDP扫描</el-radio-button>
+            <el-tooltip content="TCP Connect扫描Top1000常见端口，速度快" placement="top">
+              <el-radio-button value="nmap_syn">Top1000扫描</el-radio-button>
             </el-tooltip>
           </el-radio-group>
         </el-form-item>
@@ -80,9 +57,6 @@
             <el-tooltip content="探测开放端口上运行的服务及版本号，强烈推荐搭配端口扫描使用" placement="top">
               <el-checkbox value="nmap_service">服务版本识别</el-checkbox>
             </el-tooltip>
-            <el-tooltip content="通过TCP/IP指纹识别目标操作系统，需root且目标需至少1个开放端口" placement="top">
-              <el-checkbox value="nmap_os">操作系统识别</el-checkbox>
-            </el-tooltip>
             <el-tooltip content="运行Nmap默认脚本进行漏洞探测和安全检查，耗时较长" placement="top">
               <el-checkbox value="nmap_script">脚本扫描</el-checkbox>
             </el-tooltip>
@@ -90,11 +64,9 @@
         </el-form-item>
         <div style="margin:-8px 0 16px 100px;color:#909399;font-size:12px">
           <span>快捷组合：</span>
-          <el-link type="primary" :underline="false" @click="applyPreset('syn_svc')">SYN+服务识别</el-link>
+          <el-link type="primary" :underline="false" @click="applyPreset('syn_svc')">Top1000+服务识别</el-link>
           <span style="margin:0 8px">|</span>
-          <el-link type="primary" :underline="false" @click="applyPreset('connect_svc')">全连接+服务识别</el-link>
-          <span style="margin:0 8px">|</span>
-          <el-link type="primary" :underline="false" @click="applyPreset('full')">全面扫描</el-link>
+          <el-link type="primary" :underline="false" @click="applyPreset('full')">全端口+服务+脚本</el-link>
         </div>
         <el-form-item label="端口范围">
           <el-input v-model="scanForm.ports" placeholder="留空则扫描全端口1-65535，自定义如 22,80,443 或 1-1000" />
@@ -190,12 +162,8 @@
         </el-form-item>
         <el-form-item label="扫描模式">
           <el-select v-model="editForm.scan_mode">
-            <el-option label="快速" value="quick" />
-            <el-option label="标准" value="standard" />
-            <el-option label="隐蔽-轻度" value="stealth_light" />
-            <el-option label="隐蔽-中度" value="stealth_medium" />
-            <el-option label="隐蔽-深度" value="stealth_deep" />
-            <el-option label="自定义" value="custom" />
+            <el-option label="标准扫描" value="standard" />
+            <el-option label="逐IP扫描" value="ip_sequential" />
           </el-select>
         </el-form-item>
         <el-form-item label="端口范围">
@@ -320,7 +288,7 @@ const scanRules = {
   scan_mode: [{ required: true, message: '请选择扫描模式', trigger: 'change' }]
 }
 
-const modeLabel = (m) => ({ quick: '快速', standard: '标准', stealth_light: '隐蔽-轻度', stealth_medium: '隐蔽-中度', stealth_deep: '隐蔽-深度', custom: '自定义' }[m] || m)
+const modeLabel = (m) => ({ standard: '标准', ip_sequential: '逐IP' }[m] || m)
 const statusType = (s) => ({ pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: 'info' }[s] || 'info')
 const statusLabel = (s) => ({ pending: '等待中', running: '扫描中', completed: '已完成', failed: '失败', cancelled: '已取消' }[s] || s)
 const scanDuration = (row) => {
@@ -338,9 +306,8 @@ const scanDuration = (row) => {
 
 const applyPreset = (preset) => {
   const presets = {
-    syn_svc:     { port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service'] },
-    connect_svc: { port_scan_method: 'nmap_connect', service_detect: ['nmap_service'] },
-    full:        { port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service', 'nmap_os', 'nmap_script'] },
+    syn_svc: { port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service'] },
+    full:    { port_scan_method: 'nmap_syn_full', service_detect: ['nmap_service', 'nmap_script'] },
   }
   const p = presets[preset]
   if (p) Object.assign(scanForm, p)

@@ -47,15 +47,13 @@ class ScanType(str, enum.Enum):
 
 
 class ScanMethod(str, enum.Enum):
-    nmap_syn = "nmap_syn"
-    nmap_syn_full = "nmap_syn_full"
-    nmap_connect = "nmap_connect"
-    nmap_udp = "nmap_udp"
-    nmap_service = "nmap_service"
-    nmap_os = "nmap_os"
-    nmap_script = "nmap_script"
-    nmap_ping = "nmap_ping"
-    nmap_arp = "nmap_arp"
+    # 注意: nmap_syn 名称暗示 SYN 扫描，但实际是 TCP Connect(-sT)，保留名称仅为向后兼容
+    nmap_syn = "nmap_syn"           # TCP Connect 扫描 (Top1000)，命名历史遗留
+    nmap_syn_full = "nmap_syn_full" # TCP Connect 全端口扫描
+    nmap_connect = "nmap_connect"   # TCP Connect 扫描 (等同 nmap_syn，兼容旧数据)
+    nmap_service = "nmap_service"   # 服务版本识别 (-sV)
+    nmap_script = "nmap_script"     # 脚本扫描 (-sC)
+    nmap_ping = "nmap_ping"         # Ping 主机发现 (-sn)
 
 
 class ScanCategory(str, enum.Enum):
