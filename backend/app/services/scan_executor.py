@@ -390,15 +390,20 @@ async def _phase2_top1000(targets: str, scan_mode: str, max_concurrent: int,
 async def run_host_discovery(targets: str, scan_mode: str, ports: str | None,
                               scan_task_id: int, all_results: dict,
                               db: AsyncSession, scan_task: ScanTask):
-    """主机发现扫描（标准策略）：两阶段 Ping + Top1000。
+    """主机发现扫描：两阶段 Ping + Top1000。
+
+    scan_mode 决定内部并发策略:
+    - "standard": 多IP合并为1次nmap调用
+    - "ip_sequential": 每IP单独1次nmap调用
 
     - 阶段1: Ping探测 (0-30%)
     - 阶段2: Top1000端口发现 (30-100%)
     - 所有nmap操作使用 -sT (TCP Connect)，不需要root权限
     - 阶段失败不影响后续，所有日志完全记录
     """
+    mode_label = "逐IP" if scan_mode == "ip_sequential" else "标准"
     max_concurrent = scan_task.max_concurrent or 4
-    await _append_log(db, scan_task, f"开始主机发现扫描(标准策略), 目标: {targets}, 并发: {max_concurrent}")
+    await _append_log(db, scan_task, f"开始主机发现扫描({mode_label}策略), 目标: {targets}, 并发: {max_concurrent}")
     phase_errors: dict[str, str] = {}
 
     # ===== 阶段1: Ping探测 =====
@@ -423,52 +428,7 @@ async def run_host_discovery(targets: str, scan_mode: str, ports: str | None,
 
     total_hosts = len(all_results)
     total_ports = sum(len(r.get("ports", [])) for r in all_results.values())
-    await _append_log(db, scan_task, f"主机发现扫描完成(标准策略): 共 {total_hosts} 主机, {total_ports} 开放端口")
-
-    progress = 100
-    yield progress, list(phase_errors.values()), new_results_data
-
-
-# ========================================================================
-# 策略B: 逐IP扫描 — 逐IP扫描 + 每IP内端口分块并发
-# ========================================================================
-
-async def run_host_discovery_ip_sequential(targets: str, scan_mode: str, ports: str | None,
-                                             scan_task_id: int, all_results: dict,
-                                             db: AsyncSession, scan_task: ScanTask):
-    """主机发现扫描（逐IP策略）：两阶段 Ping + Top1000。
-
-    - 阶段1: Ping探测 (0-30%)
-    - 阶段2: Top1000端口发现, 逐IP并发 (30-100%)
-    - 所有nmap操作使用 -sT (TCP Connect)，不需要root权限
-    """
-    max_concurrent = scan_task.max_concurrent or 4
-    await _append_log(db, scan_task, f"开始主机发现扫描(逐IP策略), 目标: {targets}, 并发: {max_concurrent}")
-    phase_errors: dict[str, str] = {}
-
-    # ===== 阶段1: Ping探测 =====
-    ping_errors = await _phase1_ping(targets, scan_mode, max_concurrent, scan_task_id, all_results, db, scan_task)
-    phase_errors.update(ping_errors)
-
-    await _update_progress(db, scan_task, PROGRESS_PHASE1_END, all_results)
-    yield PROGRESS_PHASE1_END, list(phase_errors.values()), []
-
-    # ===== 阶段2: Top1000端口发现 =====
-    top1000_errors = await _phase2_top1000(targets, scan_mode, max_concurrent, scan_task_id, all_results, db, scan_task)
-    phase_errors.update(top1000_errors)
-
-    # 最终汇总
-    new_results_data = []
-    for r in all_results.values():
-        ip = r.get("ip")
-        if ip:
-            persisted = await persist_host_incremental(db, scan_task_id, ip, r)
-            if persisted:
-                new_results_data.append(persisted)
-
-    total_hosts = len(all_results)
-    total_ports = sum(len(r.get("ports", [])) for r in all_results.values())
-    await _append_log(db, scan_task, f"主机发现扫描完成(逐IP策略): 共 {total_hosts} 主机, {total_ports} 开放端口")
+    await _append_log(db, scan_task, f"主机发现扫描完成({mode_label}策略): 共 {total_hosts} 主机, {total_ports} 开放端口")
 
     progress = 100
     yield progress, list(phase_errors.values()), new_results_data
@@ -794,17 +754,11 @@ async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id
             scan_mode_val = scan_task.scan_mode.value if hasattr(scan_task.scan_mode, 'value') else scan_task.scan_mode
 
             if is_host_discovery:
-                # 根据 scan_mode 选择扫描策略
-                if scan_mode_val == "ip_sequential":
-                    scan_gen = run_host_discovery_ip_sequential(
-                        scan_task.targets, scan_mode_val,
-                        scan_task.ports, scan_task_id, all_results, db, scan_task
-                    )
-                else:
-                    scan_gen = run_host_discovery(
-                        scan_task.targets, scan_mode_val,
-                        scan_task.ports, scan_task_id, all_results, db, scan_task
-                    )
+                # 主机发现固定走两阶段(Ping+Top1000)，scan_mode 在阶段函数内部区分并发策略
+                scan_gen = run_host_discovery(
+                    scan_task.targets, scan_mode_val,
+                    scan_task.ports, scan_task_id, all_results, db, scan_task
+                )
 
                 async for progress, errors, new_results in scan_gen:
                     scan_task.progress = progress

@@ -25,8 +25,7 @@ async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
         await asyncio.wait_for(
             asyncio.to_thread(
                 run_scan_task.delay,
-                task.id, req.targets, req.scan_mode.value,
-                [m.value for m in req.scan_methods], req.ports
+                task.id, req.targets, req.scan_mode.value, req.ports
             ),
             timeout=3.0
         )
@@ -289,8 +288,7 @@ async def rescan_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), 
         await asyncio.wait_for(
             asyncio.to_thread(
                 run_scan_task.delay,
-                task.id, task.targets, scan_mode_val,
-                task.scan_methods or [], task.ports
+                task.id, task.targets, scan_mode_val, task.ports
             ),
             timeout=3.0
         )

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPExce
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db, async_session
-from app.models.models import ScanTask, ScanResult, ScanType, ScanStatus, ScanCategory, ScanMethod, User
+from app.models.models import ScanTask, ScanResult, ScanType, ScanStatus, ScanCategory, User
 from app.schemas.discovery import ScanRequest, ScanTaskResponse, ScanResultResponse, ScanUpdateRequest
 from app.middleware.auth import get_current_user
 from app.services.auth import decode_token
@@ -13,8 +13,6 @@ from app.services.auth import decode_token
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/host-scans", tags=["主机发现"])
-
-HOST_METHODS = {ScanMethod.nmap_ping, ScanMethod.nmap_syn}
 
 
 async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
@@ -25,8 +23,7 @@ async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
         await asyncio.wait_for(
             asyncio.to_thread(
                 run_scan_task.delay,
-                task.id, req.targets, req.scan_mode.value,
-                [m.value for m in req.scan_methods], req.ports
+                task.id, req.targets, req.scan_mode.value, req.ports
             ),
             timeout=3.0
         )
@@ -65,7 +62,7 @@ async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db),
     task = ScanTask(
         name=req.name, targets=req.targets, scan_category=ScanCategory.host_discovery,
         scan_type=req.scan_type, scan_mode=req.scan_mode,
-        scan_methods=["nmap_ping", "nmap_syn"],
+        scan_methods=[],  # 主机发现固定两阶段(Ping+Top1000)，scan_methods 不参与调度
         ports=req.ports, max_concurrent=req.max_concurrent, interval_minutes=req.interval_minutes,
         created_by=current_user.id, next_run=next_run,
         is_active=True
@@ -124,8 +121,7 @@ async def update_host_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSessio
         task.targets = req.targets
     if req.scan_mode is not None:
         task.scan_mode = req.scan_mode
-    if req.scan_methods is not None:
-        task.scan_methods = [m.value for m in req.scan_methods]
+    # scan_methods 不处理：主机发现固定两阶段，不接受外部修改
     if req.ports is not None:
         task.ports = req.ports
     if req.max_concurrent is not None:
@@ -286,8 +282,7 @@ async def rescan_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), cur
         await asyncio.wait_for(
             asyncio.to_thread(
                 run_scan_task.delay,
-                task.id, task.targets, scan_mode_val,
-                task.scan_methods or [], task.ports
+                task.id, task.targets, scan_mode_val, task.ports
             ),
             timeout=3.0
         )

@@ -342,7 +342,7 @@ const handleSubmit = async () => {
   }
   submitting.value = true
   try {
-    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, scan_mode: scanForm.scan_mode, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery', scan_methods: ['nmap_ping', 'nmap_syn'], }
+    const payload = { name: scanForm.name, targets: scanForm.targets, scan_type: scanForm.scan_type, scan_mode: scanForm.scan_mode, max_concurrent: scanForm.max_concurrent, interval_minutes: scanForm.interval_minutes, scan_category: 'host_discovery' }
     await createHostScan(payload)
     ElMessage.success('主机发现任务已创建')
     scanForm.name = ''

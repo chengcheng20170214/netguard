@@ -31,7 +31,7 @@ class ScanRequest(BaseModel):
     scan_category: ScanCategory = ScanCategory.host_discovery
     scan_type: ScanType = ScanType.one_time
     scan_mode: ScanMode = ScanMode.standard
-    scan_methods: list[ScanMethod] = ["nmap_syn_full", "nmap_service"]
+    scan_methods: list[ScanMethod] = []  # 服务发现时填写，主机发现时忽略（固定两阶段）
     ports: str | None = None
     max_concurrent: int = 4
 
