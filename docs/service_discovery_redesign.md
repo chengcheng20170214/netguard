@@ -84,9 +84,11 @@ nmap -sT -sV --version-intensity 7 -p 22,80,443,3306 target
 nmap -sT --script=vuln -p 22,80,443,3306 target
 ```
 
-引擎自动判断是否可合并：
-- 阶段2+3 同时启用且无特殊 script_args → 合并为一次调用
-- 阶段3 单独启用或 script_args 需独立设置 → 分开调用
+**阶段2+3 合并策略（已确认 → 始终合并）：**
+- 阶段2+3 同时启用 → 始终合并为一次 nmap 调用（`-sV --script=...`）
+- 仅启用阶段2 → 单独 `-sV` 调用
+- 仅启用阶段3 → 单独 `--script` 调用
+- 注：即使有 `script_args`，也可在合并调用中通过 `--script-args=` 传入，无需分开执行
 
 ### 2.3 进度分配
 
@@ -154,13 +156,21 @@ class ScanProfile(Base):
     # ===== 通用时序参数 =====
     timing = Column(JSON, default=dict)
     # {
-    #   "host_timeout": 300,       # 单主机超时(秒)，0=不限
-    #   "max_retries": 3,
-    #   "min_rate": 300,
-    #   "max_rtt_timeout_ms": 500,
-    #   "initial_rtt_timeout_ms": 200,
-    #   "max_scan_delay_ms": 10
+    #   "host_timeout": 300,       # 单主机超时(秒)，0=不限 → --host-timeout
+    #   "nmap_timeout_sec": 7200,  # nmap进程整体超时(秒)，0=不限 → asyncio.wait_for 层面
+    #   "script_timeout_sec": 60,  # 单个NSE脚本超时(秒) → --script-timeout
+    #   "max_retries": 3,          # 端口重试次数 → --max-retries
+    #   "min_rate": 300,           # 最小发包速率 → --min-rate
+    #   "max_rtt_timeout_ms": 500, # 最大RTT超时(ms) → --max-rtt-timeout
+    #   "initial_rtt_timeout_ms": 200, # 初始RTT超时(ms) → --initial-rtt-timeout
+    #   "max_scan_delay_ms": 10    # 最大扫描延迟(ms) → --max-scan-delay
     # }
+    #
+    # ★ 超时层次关系: script_timeout_sec << host_timeout << nmap_timeout_sec
+    #   - script_timeout_sec: 单个NSE脚本超时，防止某个脚本卡死
+    #   - host_timeout: nmap对单主机的超时，主机不可达时及时放弃
+    #   - nmap_timeout_sec: Python层面asyncio.wait_for对整个nmap进程的超时，
+    #                       是最终安全网，防止nmap进程整体卡死
 
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
@@ -195,6 +205,8 @@ class ScanProfile(Base):
   "os_detect": { "enabled": false },
   "timing": {
     "host_timeout": 60,
+    "nmap_timeout_sec": 3600,
+    "script_timeout_sec": 30,
     "max_retries": 2,
     "min_rate": 500,
     "max_rtt_timeout_ms": 500,
@@ -228,6 +240,8 @@ class ScanProfile(Base):
   "os_detect": { "enabled": false },
   "timing": {
     "host_timeout": 0,
+    "nmap_timeout_sec": 14400,
+    "script_timeout_sec": 120,
     "max_retries": 3,
     "min_rate": 300,
     "max_rtt_timeout_ms": 500,
@@ -274,8 +288,25 @@ def upgrade():
     # 2. scan_tasks 表新增 scan_profile_id
     op.add_column('scan_tasks', sa.Column('scan_profile_id', sa.Integer(), nullable=True))
     op.create_foreign_key('fk_scan_tasks_profile', 'scan_tasks', 'scan_profiles', ['scan_profile_id'], ['id'])
+    # 3. scan_tasks 表新增断点恢复字段
+    op.add_column('scan_tasks', sa.Column('current_phase', sa.Integer(), default=0))
+    op.add_column('scan_tasks', sa.Column('last_duration_sec', sa.Integer(), nullable=True))
+    # 4. 创建 scan_checkpoints 独立表（替代 ScanTask 上的 JSON 列）
+    op.create_table(
+        'scan_checkpoints',
+        sa.Column('id', sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column('task_id', sa.Integer(), sa.ForeignKey('scan_tasks.id'), nullable=False, index=True),
+        sa.Column('phase', sa.Integer(), nullable=False),
+        sa.Column('key', sa.String(64), nullable=False),
+        sa.Column('value', sa.JSON(), nullable=True),
+        sa.Column('updated_at', sa.DateTime()),
+        sa.UniqueConstraint('task_id', 'phase', 'key', name='uq_checkpoint_task_phase_key'),
+    )
 
 def downgrade():
+    op.drop_table('scan_checkpoints')
+    op.drop_column('scan_tasks', 'last_duration_sec')
+    op.drop_column('scan_tasks', 'current_phase')
     op.drop_constraint('fk_scan_tasks_profile', 'scan_tasks', type_='foreignkey')
     op.drop_column('scan_tasks', 'scan_profile_id')
     op.drop_table('scan_profiles')
@@ -285,6 +316,11 @@ def downgrade():
 
 ## 四、后端执行引擎设计
 
+> **架构决策②：结果直写DB，去掉 all_results**
+> 旧方案在内存中维护 `all_results` 字典不断累积，500主机全端口可达50MB+，
+> 一周运行期间持续增长可能 OOM。新方案扫完每个IP立即写DB，内存只保留
+> 下一阶段需要的 `open_ports_map`（约140KB vs 10-50MB，降低100-350倍）。
+
 ### 4.1 渐进式探测主流程
 
 ```python
@@ -292,14 +328,16 @@ async def run_service_discovery(
     targets: str,
     profile: ScanProfile,
     scan_task_id: int,
-    all_results: dict,
+    # ★ 不再传入 all_results — 结果直写DB
     db: AsyncSession,
     scan_task: ScanTask,
 ):
     """渐进式服务发现：端口发现 → 服务识别 → 脚本探测 → OS识别
 
-    核心优化：阶段2/3/4只对阶段1发现的开放端口做定向探测，
-    避免重复扫描全端口。
+    核心设计原则：
+    1. 阶段2/3/4只对阶段1发现的开放端口做定向探测，避免重复扫描全端口
+    2. 每个IP扫完立即持久化到DB，内存中不累积完整结果
+    3. 内存只保留 open_ports_map（下一阶段的输入），约140KB
     """
     port_config = profile.port_scan or {}
     svc_config = profile.service_detect or {}
@@ -322,43 +360,41 @@ async def run_service_discovery(
     # ── 阶段1: 端口发现（必须执行）──────────────────────
     await _append_log(db, scan_task, f"[阶段1/端口发现] 开始, 模式: {port_config.get('mode')}")
 
+    # ★ open_ports_map 是阶段间唯一在内存中传递的数据
+    # 格式: { "192.168.1.1": [22, 80, 443], "192.168.1.2": [3306] }
+    # 估算内存: 500IP × 平均10端口 × 28bytes ≈ 140KB
     open_ports_map = await _phase1_port_scan(
         targets, port_config, timing_config,
-        scan_task_id, all_results, db, scan_task
+        scan_task_id, db, scan_task
     )
-    # open_ports_map = { "192.168.1.1": [22, 80, 443], "192.168.1.2": [3306] }
 
     phase_idx = 1
     yield progress_ranges[phase_idx][1], [], []  # 阶段1结束进度
 
-    # ── 阶段2+3 合并判断 ──────────────────────────────
+    # ── 阶段2+3 合并判断（已确认：始终合并）───────────────
     svc_enabled = svc_config.get("enabled", False)
     script_enabled = script_config.get("enabled", False)
-    can_merge_svc_script = (
-        svc_enabled and script_enabled
-        and not script_config.get("script_args")  # 有 script_args 时分开执行
-    )
 
-    # ── 阶段2: 服务版本识别（可选）──────────────────────
-    if svc_enabled and not can_merge_svc_script:
+    # ── 阶段2+3 合并执行（同时启用时始终合并）──────────────
+    if svc_enabled and script_enabled:
+        phase_idx += 1
+        await _append_log(db, scan_task, "[阶段2+3/服务识别+脚本扫描] 合并执行")
+        await _phase23_merged(open_ports_map, svc_config, script_config, timing_config, ...)
+        phase_idx += 1  # 合并占两个阶段的进度
+
+    # ── 阶段2: 仅服务版本识别（脚本未启用时单独执行）────────
+    elif svc_enabled:
         phase_idx += 1
         await _append_log(db, scan_task, f"[阶段2/服务识别] 开始, intensity={svc_config.get('intensity', 7)}")
         await _phase2_service_detect(open_ports_map, svc_config, timing_config, ...)
         yield progress_ranges[phase_idx][1], [], []
 
-    # ── 阶段3: 脚本扫描（可选）──────────────────────────
-    if script_enabled and not can_merge_svc_script:
+    # ── 阶段3: 仅脚本扫描（服务识别未启用时单独执行）────────
+    elif script_enabled:
         phase_idx += 1
         await _append_log(db, scan_task, f"[阶段3/脚本扫描] 开始, categories={script_config.get('categories')}")
         await _phase3_script_scan(open_ports_map, script_config, timing_config, ...)
         yield progress_ranges[phase_idx][1], [], []
-
-    # ── 阶段2+3 合并执行 ──────────────────────────────
-    if can_merge_svc_script:
-        phase_idx += 1
-        await _append_log(db, scan_task, "[阶段2+3/服务识别+脚本扫描] 合并执行")
-        await _phase23_merged(open_ports_map, svc_config, script_config, timing_config, ...)
-        yield progress_ranges[phase_idx + 1][1], [], []  # 合并占两个阶段的进度
 
     # ── 阶段4: OS识别（可选）────────────────────────────
     if os_config.get("enabled"):
@@ -367,12 +403,19 @@ async def run_service_discovery(
         await _phase4_os_detect(open_ports_map, os_config, timing_config, ...)
         yield progress_ranges[phase_idx][1], [], []
 
-    # 最终汇总
-    ...
+    # ★ 最终汇总 — 从DB查询，不依赖内存
+    summary = await _get_scan_summary(db, scan_task_id)
+    await _append_log(db, scan_task,
+        f"扫描完成: 发现 {summary['total_hosts']} 台主机, "
+        f"{summary['total_ports']} 个开放端口")
     yield 100, [], []
 ```
 
 ### 4.2 各阶段详细设计
+
+> **核心变化**：所有阶段函数不再接收 `all_results` 参数。
+> 扫描结果立即通过 `persist_host_incremental()` 写入DB，
+> 不在内存中累积。阶段间只传递 `open_ports_map`（端口映射）。
 
 #### 阶段1 - 端口发现
 
@@ -382,7 +425,7 @@ async def _phase1_port_scan(
     port_config: dict,
     timing_config: dict,
     scan_task_id: int,
-    all_results: dict,
+    # ★ 不再传入 all_results
     db: AsyncSession,
     scan_task: ScanTask,
 ) -> dict[str, list[int]]:
@@ -390,6 +433,7 @@ async def _phase1_port_scan(
 
     Returns:
         open_ports_map: { "192.168.1.1": [22, 80, 443], ... }
+        ★ 这是阶段间唯一在内存中传递的数据结构
     """
     mode = port_config.get("mode", "top1000")
     scan_mode = port_config.get("scan_mode", "standard")
@@ -405,7 +449,11 @@ async def _phase1_port_scan(
         # 复用现有 run_chunked_full_scan 逻辑
         # nmap -sT -p 1-65535 分块扫描
         async for progress, errors, new_results in run_chunked_full_scan(...):
-            ...
+            # ★ 逐块直写DB，不在内存中累积
+            for r in new_results:
+                r_ip = r.get("ip")
+                if r_ip:
+                    await persist_host_incremental(db, scan_task_id, r_ip, r)
 
     elif mode == "custom":
         # nmap -sT -p {custom_ports} -T4 -Pn -n [timing] targets
@@ -413,15 +461,46 @@ async def _phase1_port_scan(
         scanner = NmapScanner()
         args = build_phase_args("port_scan", custom_ports, timing_config)
         results = await scanner.scan(targets, custom_ports, scan_method="nmap_syn", ...)
-        _merge_results(all_results, results, skip_no_ports=True)
+        # ★ 直写DB
+        for r in results:
+            r_ip = r.get("ip")
+            if r_ip:
+                await persist_host_incremental(db, scan_task_id, r_ip, r)
 
-    # 构建 open_ports_map
+    # ★ 从DB查询已持久化的结果，构建 open_ports_map
+    # 这比内存中的 all_results 小100-350倍
+    open_ports_map = await _build_open_ports_map_from_db(db, scan_task_id)
+
+    return open_ports_map
+```
+
+```python
+async def _build_open_ports_map_from_db(
+    db: AsyncSession,
+    scan_task_id: int,
+) -> dict[str, list[int]]:
+    """从DB查询已持久化的端口发现结果，构建下一阶段所需的端口映射
+
+    替代旧方案中从内存 all_results 构建 open_ports_map 的逻辑。
+    查询开销远小于维护 all_results 的内存开销。
+    """
+    from sqlalchemy import func, distinct
+    
+    # 查询该任务所有已发现主机的开放端口
+    # ScanResult 记录已由 persist_host_incremental 写入
+    result = await db.execute(
+        select(ScanResult.ip, ScanResult.ports)
+        .where(ScanResult.scan_task_id == scan_task_id)
+    )
+    
     open_ports_map = {}
-    for ip, data in all_results.items():
-        open_ports = [p["port"] for p in data.get("ports", []) if p.get("state") == "open"]
-        if open_ports:
-            open_ports_map[ip] = open_ports
-
+    for ip, ports_json in result.all():
+        if ip and ports_json:
+            ports = json.loads(ports_json) if isinstance(ports_json, str) else ports_json
+            open_ports = [p["port"] for p in ports if p.get("state") == "open"]
+            if open_ports:
+                open_ports_map[ip] = open_ports
+    
     return open_ports_map
 ```
 
@@ -433,7 +512,7 @@ async def _phase2_service_detect(
     svc_config: dict,
     timing_config: dict,
     scan_task_id: int,
-    all_results: dict,
+    # ★ 不再传入 all_results — 结果直写DB
     db: AsyncSession,
     scan_task: ScanTask,
 ):
@@ -452,12 +531,13 @@ async def _phase2_service_detect(
         scanner = NmapScanner()
         results = await scanner.scan_with_args(ip, args)
 
-        # 合并：更新 all_results 中该 IP 的 service/version 字段
-        _merge_service_info(all_results, results)
-
-        # 持久化
+        # ★ 直写DB — 不再 _merge_service_info(all_results, results)
+        # persist_host_incremental 内部处理合并逻辑：
+        # 对同一IP同一端口，补充 service/version 字段
         for r in results:
-            await persist_host_incremental(db, scan_task_id, r.get("ip"), r)
+            r_ip = r.get("ip")
+            if r_ip:
+                await persist_host_incremental(db, scan_task_id, r_ip, r)
 ```
 
 #### 阶段3 - 脚本扫描
@@ -468,7 +548,7 @@ async def _phase3_script_scan(
     script_config: dict,
     timing_config: dict,
     scan_task_id: int,
-    all_results: dict,
+    # ★ 不再传入 all_results — 结果直写DB
     db: AsyncSession,
     scan_task: ScanTask,
 ):
@@ -489,11 +569,13 @@ async def _phase3_script_scan(
         scanner = NmapScanner()
         results = await scanner.scan_with_args(ip, args)
 
-        # 合并：更新 all_results 中该 IP 的 script_output 字段
-        _merge_script_info(all_results, results)
-
+        # ★ 直写DB — 不再 _merge_script_info(all_results, results)
+        # persist_host_incremental 内部处理合并逻辑：
+        # 对同一IP同一端口，追加 script_output 字段
         for r in results:
-            await persist_host_incremental(db, scan_task_id, r.get("ip"), r)
+            r_ip = r.get("ip")
+            if r_ip:
+                await persist_host_incremental(db, scan_task_id, r_ip, r)
 ```
 
 #### 阶段2+3 - 合并执行
@@ -505,11 +587,15 @@ async def _phase23_merged(
     script_config: dict,
     timing_config: dict,
     scan_task_id: int,
-    all_results: dict,
+    # ★ 不再传入 all_results — 结果直写DB
     db: AsyncSession,
     scan_task: ScanTask,
 ):
-    """合并 -sV + --script 为一次 nmap 调用"""
+    """合并 -sV + --script 为一次 nmap 调用
+
+    ★ 架构决策①：始终合并阶段2+3（去掉 can_merge_svc_script 条件判断）
+    即使有 script_args，也可通过 --script-args= 传入，无需分开执行。
+    """
     intensity = svc_config.get("intensity", 7)
     categories = ",".join(script_config.get("categories", ["default"]))
     script_spec = categories
@@ -532,11 +618,13 @@ async def _phase23_merged(
         scanner = NmapScanner()
         results = await scanner.scan_with_args(ip, args)
 
-        _merge_service_info(all_results, results)
-        _merge_script_info(all_results, results)
-
+        # ★ 直写DB — 一次调用同时包含 service+script 信息
+        # persist_host_incremental 内部合并：
+        # 补充 service/version + 追加 script_output
         for r in results:
-            await persist_host_incremental(db, scan_task_id, r.get("ip"), r)
+            r_ip = r.get("ip")
+            if r_ip:
+                await persist_host_incremental(db, scan_task_id, r_ip, r)
 ```
 
 #### 阶段4 - OS识别
@@ -547,7 +635,7 @@ async def _phase4_os_detect(
     os_config: dict,
     timing_config: dict,
     scan_task_id: int,
-    all_results: dict,
+    # ★ 不再传入 all_results — 结果直写DB
     db: AsyncSession,
     scan_task: ScanTask,
 ):
@@ -574,12 +662,10 @@ async def _phase4_os_detect(
         scanner = NmapScanner()
         results = await scanner.scan_with_args(ip, args)
 
-        # 更新 OS 信息
+        # ★ 直写DB — OS信息更新到已有主机记录
         for r in results:
             ip_key = r.get("ip")
             if ip_key and r.get("os"):
-                if ip_key in all_results:
-                    all_results[ip_key]["os"] = r["os"]
                 await persist_host_incremental(db, scan_task_id, ip_key, r)
 ```
 
@@ -674,57 +760,114 @@ def _calc_progress_ranges(enabled_phases: int) -> dict[int, tuple[int, int]]:
         return {1: (0, 35), 2: (35, 60), 3: (60, 85), 4: (85, 100)}
 ```
 
-### 4.6 结果合并辅助函数
+### 4.6 结果持久化与合并（DB层）
+
+> **替代旧方案的内存合并**：旧方案用 `_merge_service_info(all_results, ...)`
+> 和 `_merge_script_info(all_results, ...)` 在内存中合并结果。新方案
+> 将合并逻辑下沉到 `persist_host_incremental()` 内部，在DB层面处理字段合并。
 
 ```python
-def _merge_service_info(all_results: dict, scan_results: list[dict]):
-    """合并服务版本信息到全局结果
+async def persist_host_incremental(
+    db: AsyncSession,
+    scan_task_id: int,
+    ip: str,
+    result: dict,
+):
+    """将单个主机的扫描结果持久化到DB，自动合并已有记录
 
-    更新端口条目的 service/version 字段，不新增端口
+    合并策略：
+    - 同一IP在ScanResult中已有记录时，合并而非覆盖
+    - 端口列表：以 port/proto 为key，新端口追加，已有端口合并字段
+    - service/version：只补充不覆盖（保留最详细的信息）
+    - script_output：追加（同一端口可能被多次脚本扫描）
+    - os：取最新值（后续阶段可能提供更准确结果）
     """
-    for r in scan_results:
-        ip = r.get("ip")
-        if not ip or ip not in all_results:
-            continue
-        existing = all_results[ip]
+    # 查询已有记录
+    existing = await db.execute(
+        select(ScanResult)
+        .where(
+            ScanResult.scan_task_id == scan_task_id,
+            ScanResult.ip == ip,
+        )
+    )
+    existing_record = existing.scalar_one_or_none()
+
+    if existing_record is None:
+        # 首次写入 — 直接创建
+        new_record = ScanResult(
+            scan_task_id=scan_task_id,
+            ip=ip,
+            hostname=result.get("hostname"),
+            ports=result.get("ports", []),
+            os=result.get("os"),
+            mac=result.get("mac"),
+        )
+        db.add(new_record)
+    else:
+        # 合并更新 — 在DB层面合并字段
         existing_ports = {
             f"{p['port']}/{p.get('proto', 'tcp')}": p
-            for p in (existing.get("ports") or [])
+            for p in (existing_record.ports or [])
         }
-        for new_port in r.get("ports", []):
+
+        for new_port in result.get("ports", []):
             key = f"{new_port['port']}/{new_port.get('proto', 'tcp')}"
             if key in existing_ports:
-                # 补充 service/version，不覆盖已有
+                # 合并已有端口的附加信息
                 p = existing_ports[key]
                 if new_port.get("service") and not p.get("service"):
                     p["service"] = new_port["service"]
                 if new_port.get("version") and not p.get("version"):
                     p["version"] = new_port["version"]
-
-
-def _merge_script_info(all_results: dict, scan_results: list[dict]):
-    """合并脚本输出到全局结果"""
-    for r in scan_results:
-        ip = r.get("ip")
-        if not ip or ip not in all_results:
-            continue
-        existing = all_results[ip]
-        existing_ports = {
-            f"{p['port']}/{p.get('proto', 'tcp')}": p
-            for p in (existing.get("ports") or [])
-        }
-        for new_port in r.get("ports", []):
-            key = f"{new_port['port']}/{new_port.get('proto', 'tcp')}"
-            if key in existing_ports:
-                p = existing_ports[key]
                 if new_port.get("script_output"):
-                    # 追加脚本输出
                     existing_output = p.get("script_output", "")
                     p["script_output"] = (
                         existing_output + "\n" + new_port["script_output"]
                         if existing_output
                         else new_port["script_output"]
                     )
+                # 补充 state 信息（如 filtered → open）
+                if new_port.get("state") and not p.get("state"):
+                    p["state"] = new_port["state"]
+            else:
+                # 新发现的端口 — 追加
+                existing_ports[key] = new_port
+
+        # 写回合并后的端口列表
+        existing_record.ports = list(existing_ports.values())
+
+        # 更新 OS（取最新、最详细的）
+        if result.get("os"):
+            existing_record.os = result["os"]
+
+        # 更新 hostname（取非空值）
+        if result.get("hostname") and not existing_record.hostname:
+            existing_record.hostname = result["hostname"]
+
+    await db.commit()
+```
+
+```python
+async def _get_scan_summary(db: AsyncSession, scan_task_id: int) -> dict:
+    """从DB查询扫描结果摘要（替代内存 all_results 的汇总功能）"""
+    from sqlalchemy import func
+
+    # 总主机数
+    host_count = await db.execute(
+        select(func.count(func.distinct(ScanResult.ip)))
+        .where(ScanResult.scan_task_id == scan_task_id)
+    )
+
+    # 总端口数
+    port_count = await db.execute(
+        select(func.count(ScanResult.id))
+        .where(ScanResult.scan_task_id == scan_task_id)
+    )
+
+    return {
+        "total_hosts": host_count.scalar() or 0,
+        "total_ports": port_count.scalar() or 0,
+    }
 ```
 
 ---
@@ -1057,12 +1200,12 @@ async def execute_scan(scan_task_id: int, **kwargs):
 
         if scan_task.scan_profile_id:
             # 新引擎：渐进式自动探测
+            # ★ 不再传入 all_results — 结果直写DB
             profile = await db.get(ScanProfile, scan_task.scan_profile_id)
             await run_service_discovery(
                 targets=scan_task.targets,
                 profile=profile,
                 scan_task_id=scan_task_id,
-                all_results=all_results,
                 db=db,
                 scan_task=scan_task,
             )
@@ -1240,9 +1383,13 @@ async def _phase1_port_scan(...):
     if mode == "full":
         # 复用现有分块扫描
         async for progress, errors, new_results in run_chunked_full_scan(...):
-            # 和现有逻辑一样，每个分块完成就持久化
-            ...
-        # 分块扫描结束后，从 all_results 汇总 open_ports_map
+            # ★ 每个分块完成即直写DB，不在内存中累积
+            for r in new_results:
+                r_ip = r.get("ip")
+                if r_ip:
+                    await persist_host_incremental(db, scan_task_id, r_ip, r)
+        # 分块扫描结束后，从DB查询汇总 open_ports_map
+        open_ports_map = await _build_open_ports_map_from_db(db, scan_task_id)
 ```
 
 ### 9.6 脚本扫描超时控制
@@ -1250,9 +1397,18 @@ async def _phase1_port_scan(...):
 **问题：** NSE 脚本可能非常耗时（vuln 类脚本单个端口可能需要数分钟）
 
 **方案：**
-- `--script-timeout` 参数加入 timing 配置（默认 60s）
-- `--host-timeout` 仍然有效（整主机超时）
+- `--script-timeout` 参数纳入 timing 配置字段 `script_timeout_sec`（默认 60s）
+- `--host-timeout` 仍然有效（整主机超时，由 timing.host_timeout 控制）
+- `nmap_timeout_sec` 作为单次 nmap 调用的整体超时（见11.7），兜底保护
 - 前端提示：脚本扫描可能显著增加扫描时间
+
+```python
+# timing 字段中的超时层次：
+# nmap_timeout_sec → 整体超时（asyncio.wait_for，杀进程级保护）
+# host_timeout     → 单主机超时（nmap --host-timeout 参数）
+# script_timeout_sec → 单脚本超时（nmap --script-timeout 参数）
+# 三者关系：script_timeout_sec << host_timeout << nmap_timeout_sec
+```
 
 ```python
 # timing 配置新增
@@ -1380,6 +1536,8 @@ Phase 4 - 测试 & 收尾 (1-2天)
   "os_detect": { "enabled": false },
   "timing": {
     "host_timeout": 60,
+    "nmap_timeout_sec": 600,
+    "script_timeout_sec": 30,
     "max_retries": 2,
     "min_rate": 500,
     "max_rtt_timeout_ms": 500,
@@ -1410,6 +1568,8 @@ Phase 4 - 测试 & 收尾 (1-2天)
   "os_detect": { "enabled": false },
   "timing": {
     "host_timeout": 120,
+    "nmap_timeout_sec": 1800,
+    "script_timeout_sec": 60,
     "max_retries": 2,
     "min_rate": 500,
     "max_rtt_timeout_ms": 500,
@@ -1444,6 +1604,8 @@ Phase 4 - 测试 & 收尾 (1-2天)
   "os_detect": { "enabled": false },
   "timing": {
     "host_timeout": 0,
+    "nmap_timeout_sec": 14400,
+    "script_timeout_sec": 120,
     "max_retries": 3,
     "min_rate": 300,
     "max_rtt_timeout_ms": 500,
@@ -1482,6 +1644,8 @@ Phase 4 - 测试 & 收尾 (1-2天)
   },
   "timing": {
     "host_timeout": 0,
+    "nmap_timeout_sec": 28800,
+    "script_timeout_sec": 300,
     "max_retries": 3,
     "min_rate": 200,
     "max_rtt_timeout_ms": 1000,
@@ -1492,3 +1656,1103 @@ Phase 4 - 测试 & 收尾 (1-2天)
 ```
 
 预估时间（/24 网段）：60-180 分钟
+
+---
+
+## 十一、扫描任务强健性保障
+
+### 11.1 问题背景
+
+大规模扫描场景（500+ 主机 × 全端口 + 服务识别 + 脚本探测）耗时可能超过一周，期间面临：
+
+| 风险 | 发生概率 | 影响 |
+|------|----------|------|
+| 服务重启（部署/更新/崩溃） | 高 | 任务中断，进度丢失 |
+| 阶段中途崩溃（网络异常/nmap卡死） | 中 | 该阶段从头重跑 |
+| 内存溢出（all_results 字典累积） | 中 | OOM 进程被杀 |
+| nmap 进程卡死（目标无响应） | 中 | 整个阶段阻塞 |
+| DB 连接超时（SQLite 长时间持有 session） | 低 | 写入失败 |
+| 磁盘空间不足（scan_results 膨胀） | 低 | 写入失败 |
+
+**核心设计目标：任何阶段、任何时刻中断，重启后都能从断点续跑，不丢失已完成的结果。**
+
+### 11.2 现有机制盘点
+
+| 机制 | 现状 | 覆盖范围 |
+|------|------|----------|
+| 分块持久化 (ScanChunk) | ✅ 全端口扫描14块，每块完成独立写DB | 仅阶段1全端口扫描 |
+| 失败重试 (_retry_failed_chunks) | ✅ 最多重试2次 | 仅 chunk 级别 |
+| 增量写入 (persist_host_incremental) | ✅ 每个IP扫完就写DB | 所有阶段 |
+| 阶段1 Ping 断点恢复 | ❌ 无 | 死在中间=前面白跑 |
+| 阶段1 Top1000 断点恢复 | ❌ 无 | 按组串行，死在中间=前面白跑 |
+| 阶段2/3/4 断点恢复 | ❌ 不存在 | — |
+| 服务重启恢复 | ❌ scheduler 只恢复定时器，不恢复中断的扫描 | 扫描中重启=任务永远卡 running |
+| Celery 超时 | ❌ 未配置 task_time_limit | 无限制，但 worker 重启任务丢失 |
+| DB Session 管理 | ⚠️ 单 session 贯穿整个 execute_scan | 长时间持有连接可能超时 |
+
+### 11.3 断点恢复模型
+
+> **架构决策④：checkpoint 拆为独立表**
+> 旧方案将 checkpoint/phase_status 存为 ScanTask 的 JSON 列。
+> 问题：大JSON每次更新都全量写入，随IP数增长checkpoint可达数MB，
+> 每次更新都写整个JSON列 → SQLite WAL 膨胀 + 写入性能差。
+> 新方案拆为独立表 `scan_checkpoints(task_id, phase, key, value)`，
+> 按key粒度更新，避免全量写入。
+
+#### 11.3.1 数据模型扩展
+
+```python
+# models.py ScanTask 新增字段（精简版）
+
+class ScanTask(Base):
+    __tablename__ = "scan_tasks"
+    
+    # ... 现有字段 ...
+    
+    # --- 断点恢复新增 ---
+    current_phase = Column(Integer, default=0)        # 当前阶段 (0=未开始, 1=端口发现, 2=服务识别, 3=脚本扫描, 4=OS识别)
+    last_duration_sec = Column(Integer, default=None)  # 上次扫描耗时（秒），用于智能间隔
+
+    # ★ 不再在 ScanTask 上存 checkpoint / phase_status JSON 列
+    # ★ 改为独立表 scan_checkpoints（见下方）
+
+
+# ★ 新增：scan_checkpoints 独立表
+class ScanCheckpoint(Base):
+    """断点数据独立表 — 按key粒度存储，避免大JSON全量写入"""
+    __tablename__ = "scan_checkpoints"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("scan_tasks.id"), nullable=False, index=True)
+    phase = Column(Integer, nullable=False)             # 阶段编号 (1/2/3/4)
+    key = Column(String(64), nullable=False)             # 键名（如 "completed_ips", "open_ports", "status"）
+    value = Column(JSON, nullable=True)                  # 值（JSON 格式，按key粒度更新）
+    updated_at = Column(DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
+    
+    # 唯一约束：同一任务同一阶段同一key只有一条记录
+    __table_args__ = (
+        UniqueConstraint("task_id", "phase", "key", name="uq_checkpoint_task_phase_key"),
+    )
+```
+
+#### 11.3.2 phase_status 存储结构（scan_checkpoints 表中的记录）
+
+每个阶段的 status 信息存为 scan_checkpoints 表中的一条记录：
+
+| task_id | phase | key | value |
+|---------|-------|-----|-------|
+| 42 | 1 | "status" | `{"status": "completed", "started_at": "2026-06-01T10:00:00Z", "completed_at": "2026-06-02T08:30:00Z", "hosts_discovered": 523, "open_ports_found": 2847, "duration_sec": 81000}` |
+| 42 | 2 | "status" | `{"status": "running", "started_at": "2026-06-02T08:31:00Z", "completed_at": null, "hosts_completed": 280, "hosts_total": 523}` |
+| 42 | 3 | "status" | `{"status": "pending"}` |
+| 42 | 4 | "status" | `{"status": "skipped"}` |
+
+字段说明：
+- `status`: `pending` / `running` / `completed` / `skipped` / `failed`
+- `hosts_completed`: 阶段内已完成的IP数（用于进度显示）
+- `hosts_total`: 阶段内待处理的IP总数
+- `duration_sec`: 阶段耗时，完成后填充，用于预估和智能间隔
+
+#### 11.3.3 checkpoint 数据存储（scan_checkpoints 表中的记录）
+
+| task_id | phase | key | value |
+|---------|-------|-----|-------|
+| 42 | 1 | "open_ports" | `{"192.168.1.1": [22,80,443], "192.168.1.2": [22,3306], "192.168.1.3": [80,443,8080,8443]}` |
+| 42 | 1 | "completed_ips" | `["192.168.1.1", "192.168.1.2", "192.168.1.3"]` |
+| 42 | 1 | "chunk_status" | `{"1-5000": "completed", "5001-10000": "completed", "10001-15000": "running"}` |
+| 42 | 2 | "completed_ips" | `["192.168.1.1", "192.168.1.2"]` |
+| 42 | 3 | "completed_ips" | `[]` |
+
+说明：
+- `phase1 / open_ports`: 阶段1成果，作为阶段2/3的输入（端口精准定向）
+- `phase* / completed_ips`: 每个阶段已完成的IP列表，恢复时跳过
+- `phase1 / chunk_status`: 全端口分块扫描的断点（复用现有 ScanChunk 表，此处为冗余快照）
+
+**优势（vs 旧方案单JSON列）：**
+- 按 key 粒度更新：更新 `phase2/completed_ips` 不影响 `phase1/open_ports`
+- SQLite 只写变化的那条记录，而非整个 JSON
+- 查询方便：`WHERE task_id=? AND phase=? AND key=?` 精准定位
+
+#### 11.3.4 checkpoint 读写函数（独立表版本）
+
+```python
+async def _save_checkpoint(
+    db: AsyncSession, 
+    scan_task_id: int, 
+    phase: int, 
+    key: str, 
+    value: Any,
+):
+    """保存断点数据到 scan_checkpoints 表（按key粒度更新）"""
+    async with _db_lock:
+        # UPSERT：存在则更新，不存在则插入
+        existing = await db.execute(
+            select(ScanCheckpoint).where(
+                ScanCheckpoint.task_id == scan_task_id,
+                ScanCheckpoint.phase == phase,
+                ScanCheckpoint.key == key,
+            )
+        )
+        record = existing.scalar_one_or_none()
+        
+        if record:
+            record.value = value
+            record.updated_at = datetime.now(timezone.utc)
+        else:
+            record = ScanCheckpoint(
+                task_id=scan_task_id,
+                phase=phase,
+                key=key,
+                value=value,
+            )
+            db.add(record)
+        
+        await db.commit()
+
+
+async def _load_checkpoint(
+    db: AsyncSession,
+    scan_task_id: int,
+    phase: int,
+    key: str,
+) -> Any | None:
+    """读取单条断点数据"""
+    result = await db.execute(
+        select(ScanCheckpoint.value).where(
+            ScanCheckpoint.task_id == scan_task_id,
+            ScanCheckpoint.phase == phase,
+            ScanCheckpoint.key == key,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _load_all_checkpoints(
+    db: AsyncSession,
+    scan_task_id: int,
+) -> dict[int, dict[str, Any]]:
+    """加载任务所有断点数据（用于恢复时一次性读取）
+    
+    Returns:
+        { phase: { key: value, ... }, ... }
+        例: { 1: {"open_ports": {...}, "completed_ips": [...]}, 2: {"completed_ips": [...]} }
+    """
+    result = await db.execute(
+        select(ScanCheckpoint).where(
+            ScanCheckpoint.task_id == scan_task_id,
+        )
+    )
+    checkpoints = {}
+    for record in result.scalars().all():
+        if record.phase not in checkpoints:
+            checkpoints[record.phase] = {}
+        checkpoints[record.phase][record.key] = record.value
+    return checkpoints
+
+
+async def _update_phase_status(db: AsyncSession, scan_task_id: int, 
+                                phase: int, status: str, **kwargs):
+    """更新阶段状态（写入 scan_checkpoints 表）"""
+    async with _db_lock:
+        # 读取当前 status 值
+        existing_value = await _load_checkpoint(db, scan_task_id, phase, "status")
+        if existing_value is None:
+            existing_value = {}
+        
+        existing_value["status"] = status
+        for k, v in kwargs.items():
+            existing_value[k] = v
+        
+        await _save_checkpoint(db, scan_task_id, phase, "status", existing_value)
+        
+        # 同时更新 ScanTask.current_phase（轻量更新）
+        scan_task = await db.get(ScanTask, scan_task_id)
+        if scan_task:
+            scan_task.current_phase = phase
+            await db.commit()
+```
+
+### 11.4 断点恢复执行流程
+
+#### 11.4.1 execute_scan 改造
+
+```python
+async def execute_scan(scan_task_id: int, progress_callback=None, celery_task_id: str | None = None):
+    async with async_session() as db:
+        scan_task = await db.get(ScanTask, scan_task_id)
+        if not scan_task:
+            return
+
+        # 判断是否断点恢复
+        checkpoints = await _load_all_checkpoints(db, scan_task_id)
+        is_resume = (scan_task.current_phase > 0 
+                     and checkpoints 
+                     and scan_task.status == ScanStatus.running)
+        
+        if is_resume:
+            start_phase = scan_task.current_phase
+            phase1_completed = len(checkpoints.get(1, {}).get("completed_ips", []))
+            phase2_completed = len(checkpoints.get(2, {}).get("completed_ips", []))
+            await _append_log(db, scan_task, 
+                f"从断点恢复，阶段 {start_phase} 继续执行 "
+                f"(checkpoint: phase1完成IP {phase1_completed}, "
+                f"phase2完成IP {phase2_completed})")
+        else:
+            # 全新任务
+            scan_task.status = ScanStatus.running
+            scan_task.started_at = datetime.now(timezone.utc)
+            scan_task.progress = 0
+            scan_task.scan_log = [{"ts": datetime.now(timezone.utc).isoformat(), "msg": "任务开始执行"}]
+            scan_task.current_phase = 1
+            if celery_task_id:
+                scan_task.celery_task_id = celery_task_id
+            async with _db_lock:
+                await db.commit()
+            checkpoints = {}
+            start_phase = 1
+
+        # 获取 profile（新引擎）或走旧引擎
+        profile = None
+        if scan_task.scan_profile_id:
+            profile = await db.get(ScanProfile, scan_task.scan_profile_id)
+
+        try:
+            if profile:
+                # 新引擎：渐进式自动探测（带断点恢复）
+                await run_service_discovery(
+                    scan_task=scan_task, profile=profile,
+                    checkpoints=checkpoints, start_phase=start_phase if is_resume else 1,
+                    db=db, scan_task_id=scan_task_id,
+                    progress_callback=progress_callback,
+                )
+            else:
+                # 旧引擎：兼容 scan_methods 模式（无断点恢复）
+                await _run_legacy_scan(scan_task, db, ...)
+
+            scan_task.status = ScanStatus.completed
+            await _append_log(db, scan_task, "任务成功完成")
+
+        except asyncio.CancelledError:
+            # 优雅取消：当前断点已在各阶段内按key保存，无需额外操作
+            scan_task.status = ScanStatus.cancelled
+            await _append_log(db, scan_task, 
+                f"任务被取消（阶段 {scan_task.current_phase}，断点已保存）")
+            
+        except Exception as e:
+            # 异常：当前断点已在各阶段内按key保存，标记失败但可恢复
+            scan_task.status = ScanStatus.failed
+            scan_task.error_message = str(e)
+            await _append_log(db, scan_task, f"任务异常: {e}（断点已保存，可恢复）")
+
+        scan_task.completed_at = datetime.now(timezone.utc)
+        scan_task.progress = 100
+        scan_task.last_duration_sec = int(
+            (scan_task.completed_at - scan_task.started_at).total_seconds()
+        )
+        async with _db_lock:
+            await db.commit()
+```
+
+#### 11.4.2 run_service_discovery 改造
+
+```python
+async def run_service_discovery(
+    scan_task: ScanTask, profile: ScanProfile,
+    checkpoints: dict, start_phase: int,
+    db: AsyncSession, scan_task_id: int,
+    progress_callback=None,
+):
+    """渐进式服务发现主流程（带断点恢复）
+    
+    checkpoints 格式: { phase: { key: value, ... }, ... }
+    由 _load_all_checkpoints() 从 scan_checkpoints 表加载
+    """
+    targets = scan_task.targets
+    scan_mode_val = scan_task.scan_mode.value
+    max_concurrent = scan_task.max_concurrent
+
+    # ========================================
+    # 阶段1: 端口发现（从断点恢复）
+    # ========================================
+    if start_phase <= 1:
+        await _update_phase_status(db, scan_task_id, 1, "running",
+                                   started_at=datetime.now(timezone.utc).isoformat())
+
+        # 阶段1内部也有断点（chunk级已有，IP级新增）
+        phase1_results = await _phase1_port_scan_with_checkpoint(
+            targets, scan_mode_val, profile, max_concurrent,
+            scan_task_id, db, scan_task, checkpoints,
+        )
+
+        # 阶段1完成后，汇总 open_ports_map 写入 checkpoint（独立表按key存储）
+        await _save_checkpoint(db, scan_task_id, 1, "open_ports", phase1_results["open_ports_map"])
+        await _save_checkpoint(db, scan_task_id, 1, "completed_ips", list(phase1_results["open_ports_map"].keys()))
+
+        hosts_discovered = len(phase1_results["open_ports_map"])
+        open_ports_found = sum(len(v) for v in phase1_results["open_ports_map"].values())
+        await _update_phase_status(db, scan_task_id, 1, "completed",
+                                   completed_at=datetime.now(timezone.utc).isoformat(),
+                                   hosts_discovered=hosts_discovered,
+                                   open_ports_found=open_ports_found,
+                                   duration_sec=phase1_results["duration_sec"])
+
+    # ========================================
+    # 阶段2+3: 服务识别 + 脚本扫描（始终合并执行）
+    # ========================================
+    # ★ 从独立表读取 phase1 的 open_ports（如刚完成则用内存中的，如恢复则从DB读）
+    open_ports_map = checkpoints.get(1, {}).get("open_ports")
+    if open_ports_map is None:
+        open_ports_map = await _load_checkpoint(db, scan_task_id, 1, "open_ports") or {}
+    
+    if not open_ports_map:
+        await _append_log(db, scan_task, "阶段1未发现开放端口，跳过后续阶段")
+        return
+
+    svc_enabled = profile.service_detect.get("enabled", False)
+    script_enabled = profile.script_scan.get("enabled", False)
+
+    if start_phase <= 2 and (svc_enabled or script_enabled):
+        phase_num = 2
+        await _update_phase_status(db, scan_task_id, phase_num, "running",
+                                   started_at=datetime.now(timezone.utc).isoformat())
+
+        await _phase23_service_and_script_with_checkpoint(
+            open_ports_map, profile, scan_mode_val, max_concurrent,
+            scan_task_id, db, scan_task, checkpoints,
+        )
+
+        await _update_phase_status(db, scan_task_id, phase_num, "completed",
+                                   completed_at=datetime.now(timezone.utc).isoformat())
+
+    # ========================================
+    # 阶段4: OS识别
+    # ========================================
+    os_enabled = profile.os_detect.get("enabled", False)
+    if start_phase <= 4 and os_enabled:
+        await _update_phase_status(db, scan_task_id, 4, "running",
+                                   started_at=datetime.now(timezone.utc).isoformat())
+
+        await _phase4_os_detect_with_checkpoint(
+            open_ports_map, profile, scan_mode_val, max_concurrent,
+            scan_task_id, db, scan_task, checkpoints,
+        )
+
+        await _update_phase_status(db, scan_task_id, 4, "completed",
+                                   completed_at=datetime.now(timezone.utc).isoformat())
+```
+
+#### 11.4.3 阶段内断点恢复（以阶段2为例）
+
+```python
+async def _phase23_service_and_script_with_checkpoint(
+    open_ports_map, profile, scan_mode, max_concurrent,
+    scan_task_id, db, scan_task, checkpoints,
+):
+    """阶段2/3 服务识别+脚本扫描，带IP粒度断点"""
+    
+    # 获取已完成IP，计算剩余（从独立表读取）
+    completed_ips = set(await _load_checkpoint(db, scan_task_id, 2, "completed_ips") or [])
+    remaining = {ip: ports for ip, ports in open_ports_map.items() 
+                 if ip not in completed_ips}
+    
+    if not remaining:
+        await _append_log(db, scan_task, "阶段2/3 已全部完成，跳过")
+        return
+    
+    await _append_log(db, scan_task, 
+        f"阶段2/3 开始, {len(remaining)} 个IP待扫描 "
+        f"(已完成 {len(completed_ips)}/{len(open_ports_map)})")
+    
+    # 选择执行策略
+    executor = profile.timing.get("phase_executor", "grouped")
+    
+    if executor == "serial":
+        # 方案A：逐IP串行
+        total = len(remaining)
+        for i, (ip, ports) in enumerate(remaining.items()):
+            try:
+                args = _build_phase23_args(ip, ports, profile)
+                results = await _run_nmap_with_timeout(
+                    ip, args, timeout_sec=3600,
+                    scan_task_id=scan_task_id, db=db, scan_task=scan_task,
+                )
+                # 持久化结果
+                for r in results:
+                    await persist_host_incremental(db, scan_task_id, ip, r)
+                
+                # 更新断点（独立表按key保存）
+                completed_ips.add(ip)
+                await _save_checkpoint(db, scan_task_id, 2, "completed_ips", list(completed_ips))
+                
+            except Exception as e:
+                logger.warning(f"Phase2/3 failed for {ip}: {e}")
+                # 单IP失败不阻塞，继续下一个
+                await _append_log(db, scan_task, f"IP {ip} 扫描失败: {e}（跳过，后续可补扫）")
+            
+            # 更新进度
+            progress_in_phase = int((i + 1) / total * 100)
+            await _update_phase_status(db, scan_task_id, 2, "running",
+                                       hosts_completed=len(completed_ips),
+                                       hosts_total=len(open_ports_map))
+    
+    else:  # "grouped"
+        # 方案B：分组并行
+        ip_list = list(remaining.keys())
+        ip_groups = _split_ips_into_groups(ip_list, max_concurrent)
+        
+        for group_idx, ip_group in enumerate(ip_groups):
+            try:
+                # 组内端口取并集
+                group_ports = set()
+                for ip in ip_group:
+                    group_ports.update(remaining.get(ip, []))
+                port_spec = ",".join(str(p) for p in sorted(group_ports))
+                targets = " ".join(ip_group)
+                
+                args = _build_phase23_args(targets, port_spec, profile, is_group=True)
+                results = await _run_nmap_with_timeout(
+                    targets, args, timeout_sec=3600,
+                    scan_task_id=scan_task_id, db=db, scan_task=scan_task,
+                )
+                
+                # 持久化
+                for r in results:
+                    r_ip = r.get("ip")
+                    if r_ip:
+                        await persist_host_incremental(db, scan_task_id, r_ip, r)
+                
+                # 更新断点（整组完成，独立表按key保存）
+                for ip in ip_group:
+                    completed_ips.add(ip)
+                await _save_checkpoint(db, scan_task_id, 2, "completed_ips", list(completed_ips))
+                
+            except Exception as e:
+                logger.warning(f"Phase2/3 group {group_idx} failed: {e}")
+                await _append_log(db, scan_task, 
+                    f"组 {group_idx+1} 扫描失败: {e}（跳过，后续可补扫）")
+            
+            await _update_phase_status(db, scan_task_id, 2, "running",
+                                       hosts_completed=len(completed_ips),
+                                       hosts_total=len(open_ports_map))
+```
+
+### 11.5 服务重启恢复
+
+```python
+# main.py 启动时
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    await scheduler_service.start()
+    await _recover_interrupted_tasks()  # 新增
+
+
+async def _recover_interrupted_tasks():
+    """恢复中断的扫描任务
+    
+    扫描中服务重启 → 任务 status=running 但实际已停止
+    根据 checkpoint 决定是自动恢复还是标记失败
+    """
+    async with async_session() as db:
+        result = await db.execute(
+            select(ScanTask).where(ScanTask.status == ScanStatus.running)
+        )
+        interrupted = result.scalars().all()
+        
+        if not interrupted:
+            return
+        
+        logger.info(f"发现 {len(interrupted)} 个中断任务，尝试恢复")
+        
+        for task in interrupted:
+            # 从独立表读取断点数据
+            checkpoints = await _load_all_checkpoints(db, task.id)
+            
+            # 有断点数据 → 自动恢复
+            if task.current_phase and task.current_phase > 0 and checkpoints:
+                p1_ips = len(checkpoints.get(1, {}).get("completed_ips", []))
+                p2_ips = len(checkpoints.get(2, {}).get("completed_ips", []))
+                logger.info(f"恢复任务 {task.id}: 从阶段 {task.current_phase} 继续 "
+                           f"(已完成IP: phase1={p1_ips}, phase2={p2_ips})")
+                
+                # 异步启动恢复，不阻塞其他启动流程
+                asyncio.create_task(execute_scan(task.id))
+            
+            # 旧任务无断点 → 标记为可重试的失败
+            else:
+                task.status = ScanStatus.failed
+                task.error_message = "服务重启导致任务中断（无断点数据），请重新执行"
+                await _append_log(db, task, "服务重启导致中断，无断点可恢复")
+                async with _db_lock:
+                    await db.commit()
+```
+
+### 11.6 内存保护
+
+#### 11.6.1 问题
+
+当前 `execute_scan` 在内存中维护 `all_results` 字典，随扫描进行不断膨胀：
+
+```
+500主机 × 平均10端口 × 每端口 ~500字节数据 ≈ 2.5MB（纯数据）
+加上 Python dict 开销 ≈ 10-15MB
+如果全端口(每主机100+端口) ≈ 50MB+
+```
+
+一周运行期间，内存持续增长，可能 OOM。
+
+#### 11.6.2 方案：结果直写DB，内存只保留 checkpoint
+
+```python
+# ===== 旧方式（内存累积）=====
+all_results = {}
+# ... 扫描 ...
+all_results[ip] = result  # 越来越大
+# 最后统一写DB
+
+# ===== 新方式（直写DB + 独立表 checkpoint）=====
+# 结果立即写DB
+await persist_host_incremental(db, scan_task_id, ip, result)
+
+# 阶段1完成后，open_ports 按key写入 scan_checkpoints 独立表
+await _save_checkpoint(db, scan_task_id, 1, "open_ports", open_ports_map)
+
+# 内存中只在当前阶段内维护轻量的 working set
+# （如：当前分组的端口列表、已完成的IP set）
+# 阶段完成后即清空，从 DB 读取下一阶段输入
+
+# 估算内存占用：
+# 工作集：当前组 20IP × 平均10端口 × 端口号(int=28bytes) ≈ 5.6KB
+# checkpoint独立表：不再在内存中维护
+# vs 旧方式 10-50MB
+# 内存降低 100-350 倍
+```
+
+#### 11.6.3 结果汇总查询
+
+去掉 `all_results` 后，需要从 DB 查询汇总：
+
+```python
+async def _get_scan_summary(db: AsyncSession, scan_task_id: int) -> dict:
+    """从DB查询扫描结果摘要（替代内存 all_results）"""
+    from sqlalchemy import func
+    
+    # 总主机数
+    host_count = await db.execute(
+        select(func.count(func.distinct(ScanResult.ip)))
+        .where(ScanResult.scan_task_id == scan_task_id)
+    )
+    
+    # 总端口数
+    port_count = await db.execute(
+        select(func.count(ScanResult.id))
+        .where(ScanResult.scan_task_id == scan_task_id)
+    )
+    
+    return {
+        "total_hosts": host_count.scalar() or 0,
+        "total_ports": port_count.scalar() or 0,
+    }
+```
+
+### 11.7 nmap 进程卡死保护
+
+#### 11.7.1 超时控制
+
+```python
+async def _run_nmap_with_timeout(
+    targets: str, args: str,
+    timeout_sec: int = 3600,      # 默认1小时超时
+    scan_task_id: int = 0,
+    db: AsyncSession = None,
+    scan_task: ScanTask = None,
+) -> list[dict]:
+    """带超时的 nmap 执行，防止进程卡死"""
+    scanner_cls = SCANNER_REGISTRY.get("nmap_syn")
+    scanner = scanner_cls()
+    
+    try:
+        results = await asyncio.wait_for(
+            scanner.scan_with_args(targets, args),
+            timeout=timeout_sec,
+        )
+        return results
+    
+    except asyncio.TimeoutError:
+        logger.warning(f"nmap 扫描超时 ({timeout_sec}s): {targets}")
+        if db and scan_task:
+            await _append_log(db, scan_task, 
+                f"扫描超时 ({timeout_sec}s): {targets}，强制终止")
+        
+        # 清理残留 nmap 进程
+        await _kill_orphan_nmap_processes(scan_task_id)
+        raise
+    
+    except asyncio.CancelledError:
+        # 任务被取消，清理进程
+        await _kill_orphan_nmap_processes(scan_task_id)
+        raise
+
+
+async def _kill_orphan_nmap_processes(scan_task_id: int = 0):
+    """清理残留的 nmap 进程"""
+    import psutil
+    
+    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+        try:
+            if proc.info["name"] == "nmap":
+                # 可选：只杀属于当前任务的 nmap（通过 cmdline 判断）
+                # 简单策略：杀掉所有运行超过2小时的 nmap
+                create_time = proc.info.get("create_time", 0)
+                if create_time and (time.time() - create_time > 7200):
+                    proc.kill()
+                    logger.info(f"清理残留 nmap 进程: PID={proc.info['pid']}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+```
+
+#### 11.7.2 超时配置
+
+```python
+# profile.timing 中的超时字段（完整列表见 §3.1）
+"host_timeout": 300,           # 单主机超时(秒)，0=不限 → --host-timeout
+"nmap_timeout_sec": 7200,     # nmap进程整体超时(秒) → asyncio.wait_for 层面
+"script_timeout_sec": 60,     # 单个NSE脚本超时(秒) → --script-timeout
+
+# ★ 超时层次: script_timeout_sec << host_timeout << nmap_timeout_sec
+#   - script_timeout_sec 防止单个NSE脚本卡死（默认60s）
+#   - host_timeout 防止单主机不可达时浪费时间（默认300s）
+#   - nmap_timeout_sec 是最终安全网，防止nmap进程整体卡死（默认7200s）
+
+# 内置预设默认值
+# 快速探测: nmap_timeout_sec=600,  script_timeout_sec=30
+# 标准探测: nmap_timeout_sec=1800, script_timeout_sec=60
+# 深度探测: nmap_timeout_sec=14400,script_timeout_sec=120
+# 安全审计: nmap_timeout_sec=28800,script_timeout_sec=300
+```
+
+### 11.8 DB Session 长连接保护
+
+#### 11.8.1 问题
+
+当前 `execute_scan` 在一个 `async with async_session() as db` 中执行所有阶段，一周运行期间 SQLite 可能：
+- 连接超时
+- 写锁冲突（其他请求访问DB时）
+- WAL 文件膨胀
+
+#### 11.8.2 方案：阶段/组粒度独立 session
+
+```python
+async def run_service_discovery(scan_task, profile, checkpoints, ...):
+    # 阶段1
+    if start_phase <= 1:
+        async with async_session() as db:           # 阶段1独立 session
+            scan_task = await db.get(ScanTask, scan_task_id)
+            await _phase1_port_scan_with_checkpoint(...)
+            # checkpoint 已在各阶段内按key写入独立表，无需额外保存
+    
+    # 阶段2/3
+    if start_phase <= 2:
+        async with async_session() as db:           # 阶段2独立 session
+            scan_task = await db.get(ScanTask, scan_task_id)
+            await _phase23_service_and_script_with_checkpoint(...)
+            # checkpoint 已在各阶段内按key写入独立表，无需额外保存
+    
+    # 阶段4
+    if start_phase <= 4:
+        async with async_session() as db:           # 阶段4独立 session
+            scan_task = await db.get(ScanTask, scan_task_id)
+            await _phase4_os_detect_with_checkpoint(...)
+            # checkpoint 已在各阶段内按key写入独立表，无需额外保存
+```
+
+组粒度（阶段内每组IP用独立 session）：
+
+```python
+async def _phase23_service_and_script_with_checkpoint(...):
+    for ip_group in ip_groups:
+        async with async_session() as db:           # 每组独立 session
+            scan_task = await db.get(ScanTask, scan_task_id)
+            results = await _run_nmap_with_timeout(...)
+            for r in results:
+                r_ip = r.get("ip")
+                if r_ip:
+                    await persist_host_incremental(db, scan_task_id, r_ip, r)
+            
+            # 更新断点（独立表按key保存）
+            for ip in ip_group:
+                completed_ips.add(ip)
+            await _save_checkpoint(db, scan_task_id, 2, "completed_ips", list(completed_ips))
+```
+
+### 11.9 任务取消与优雅退出
+
+```python
+# scan_executor.py 全局取消信号
+_cancel_events: dict[int, asyncio.Event] = {}
+
+
+def request_cancel(scan_task_id: int):
+    """请求取消扫描任务"""
+    if scan_task_id in _cancel_events:
+        _cancel_events[scan_task_id].set()
+
+
+async def _check_cancelled(scan_task_id: int):
+    """检查是否被请求取消"""
+    if scan_task_id in _cancel_events and _cancel_events[scan_task_id].is_set():
+        raise asyncio.CancelledError(f"任务 {scan_task_id} 被用户取消")
+
+
+# 在每个 nmap 调用前检查
+async def _phase23_service_and_script_with_checkpoint(...):
+    for ip_group in ip_groups:
+        await _check_cancelled(scan_task_id)    # 检查取消信号
+        
+        results = await _run_nmap_with_timeout(...)
+        ...
+```
+
+取消流程：
+1. 用户点击取消 → API 调用 `request_cancel(task_id)`
+2. 当前 nmap 调用完成后（不会中途杀进程），检查到取消信号
+3. 保存当前 checkpoint
+4. 标记任务 `status=cancelled`
+5. 前端显示"已取消，可从断点恢复继续"
+
+### 11.10 周期扫描强健性
+
+#### 11.10.1 改造后的 scheduler
+
+```python
+class SchedulerService:
+    def __init__(self):
+        self._periodic_tasks: dict[int, asyncio.Task] = {}
+        self._running = False
+        self._semaphore = asyncio.Semaphore(2)  # 最多同时2个周期任务
+
+    async def _run_periodic(self, scan_task_id: int, interval_minutes: int):
+        from app.services.scan_executor import execute_scan
+
+        while self._running:
+            start_time = time.monotonic()
+
+            # 信号量控制并发
+            async with self._semaphore:
+                try:
+                    await execute_scan(scan_task_id)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Periodic scan {scan_task_id} error: {e}")
+
+            # 计算实际耗时
+            elapsed_sec = time.monotonic() - start_time
+
+            # 更新任务元数据
+            async with async_session() as db:
+                result = await db.execute(
+                    select(ScanTask).where(ScanTask.id == scan_task_id)
+                )
+                task = result.scalar_one_or_none()
+                if not task or not task.is_active or task.scan_type != ScanType.periodic:
+                    break
+
+                task.last_run = datetime.now(timezone.utc)
+                task.last_duration_sec = int(elapsed_sec)
+
+                # 智能间隔：根据耗时动态调整
+                if task.smart_interval:
+                    suggested = self._suggest_interval(elapsed_sec, task)
+                    task.next_run = datetime.now(timezone.utc) + timedelta(seconds=suggested)
+                    remaining = max(10, suggested - elapsed_sec)
+                else:
+                    task.next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+                    remaining = max(10, interval_minutes * 60 - elapsed_sec)
+
+                await db.commit()
+
+            # 等待剩余间隔（保证一轮完成后再等）
+            await asyncio.sleep(remaining)
+
+        self._periodic_tasks.pop(scan_task_id, None)
+
+    @staticmethod
+    def _suggest_interval(last_duration_sec: int, task: ScanTask) -> int:
+        """根据上次耗时和策略复杂度建议间隔（秒）"""
+        try:
+            profile = task.scan_profile  # 如果有关联 profile
+            phase_count = 1
+            if profile and profile.service_detect.get("enabled"): phase_count += 1
+            if profile and profile.script_scan.get("enabled"): phase_count += 1
+            if profile and profile.os_detect.get("enabled"): phase_count += 1
+        except Exception:
+            phase_count = 2  # 默认保守估计
+        
+        multiplier = 1.5 + phase_count * 0.5   # 2.0 ~ 3.5
+        buffer_sec = 300                         # 5分钟缓冲
+        suggested_sec = max(600, int(last_duration_sec * multiplier) + buffer_sec)
+        return min(suggested_sec, 7 * 24 * 3600)  # 最长7天
+```
+
+#### 11.10.2 周期扫描任务模型扩展
+
+```python
+# ScanTask 新增字段
+smart_interval = Column(Boolean, default=True)  # 智能间隔模式
+```
+
+前端 UI：
+```
+扫描周期:
+  ○ 智能建议 ← 默认
+    上次耗时: 8分23秒 | 推荐间隔: 约30分钟
+  ○ 固定间隔
+    间隔: [60] 分钟
+```
+
+### 11.11 磁盘空间保护（可选）
+
+```python
+async def _check_disk_space(min_gb: float = 1.0) -> bool:
+    """检查磁盘可用空间"""
+    import shutil
+    usage = shutil.disk_usage(".")
+    available_gb = usage.free / (1024 ** 3)
+    if available_gb < min_gb:
+        logger.error(f"磁盘空间不足: {available_gb:.1f}GB < {min_gb}GB")
+        return False
+    return True
+
+
+# 在 execute_scan 开头检查
+if not await _check_disk_space(min_gb=2.0):
+    scan_task.status = ScanStatus.failed
+    scan_task.error_message = "磁盘空间不足（<2GB），请清理后重试"
+    await db.commit()
+    return
+```
+
+### 11.12 阶段1端口发现的断点恢复
+
+阶段1已有 ScanChunk 机制（全端口分块），但 Ping 和 Top1000 模式缺少断点。
+
+#### 11.11.1 Top1000 模式断点
+
+```python
+async def _phase1_top1000_with_checkpoint(
+    targets, scan_mode, max_concurrent,
+    scan_task_id, db, scan_task, checkpoints,
+):
+    """Top1000 端口发现，带IP组粒度断点"""
+    
+    ip_list = _expand_targets_to_ips(targets)
+    completed_ips = set(await _load_checkpoint(db, scan_task_id, 1, "completed_ips") or [])
+    remaining_ips = [ip for ip in ip_list if ip not in completed_ips]
+    
+    if not remaining_ips:
+        await _append_log(db, scan_task, "阶段1 Top1000 已全部完成，跳过")
+        return
+    
+    await _append_log(db, scan_task, 
+        f"阶段1 Top1000: {len(remaining_ips)} IP待扫描 "
+        f"(已完成 {len(completed_ips)}/{len(ip_list)})")
+    
+    # ... 执行扫描逻辑（同 _phase23 的 serial/grouped 模式）...
+    
+    # 每完成一个IP/组，更新 checkpoint（独立表按key保存）
+    completed_ips.add(ip)
+    await _save_checkpoint(db, scan_task_id, 1, "completed_ips", list(completed_ips))
+```
+
+#### 11.11.2 全端口分块模式断点
+
+现有 ScanChunk 已提供分块级断点，补充 IP 组级断点即可：
+
+```python
+async def _phase1_full_scan_with_checkpoint(
+    targets, scan_mode, max_concurrent,
+    scan_task_id, db, scan_task, checkpoints,
+):
+    """全端口分块扫描，已有 chunk 机制 + 新增 IP 组断点"""
+    
+    # 确保分块记录存在
+    await _ensure_chunks(db, scan_task_id, scan_task)
+    
+    # 重试失败分块
+    await _retry_failed_chunks(db, scan_task_id, scan_task)
+    
+    # 获取待处理分块
+    result = await db.execute(
+        select(ScanChunk).where(
+            ScanChunk.scan_task_id == scan_task_id,
+            ScanChunk.status == ScanChunkStatus.pending,
+        ).order_by(ScanChunk.port_start)
+    )
+    pending_chunks = result.scalars().all()
+    
+    if not pending_chunks:
+        # 所有分块完成，从 ScanChunk 汇总 open_ports_map，写入独立表
+        open_ports_map = await _collect_open_ports_from_chunks(db, scan_task_id)
+        await _save_checkpoint(db, scan_task_id, 1, "open_ports", open_ports_map)
+        await _save_checkpoint(db, scan_task_id, 1, "completed_ips", list(open_ports_map.keys()))
+        return
+    
+    # 执行分块扫描（现有逻辑，略）
+    # 每个分块完成后增量更新 open_ports（独立表按key保存）
+    for chunk in pending_chunks:
+        # ... 扫描 ...
+        chunk.status = ScanChunkStatus.completed
+        await db.commit()
+        
+        # 增量更新 open_ports 到独立表
+        await _update_open_ports_from_chunk(db, scan_task_id, chunk)
+```
+
+### 11.13 强健性保障清单总览
+
+| 风险 | 保障机制 | 粒度 | 优先级 |
+|------|----------|------|--------|
+| 服务重启 | 阶段级 checkpoint + 启动自动恢复 | 阶段 | 🔴 必须 |
+| 阶段中途崩溃 | 阶段内按IP/组粒度 checkpoint | IP/组 | 🔴 必须 |
+| 全端口分块失败 | ScanChunk 重试机制（已有） | 分块 | ✅ 已有 |
+| 内存溢出 | 去掉 all_results，结果直写DB | 全局 | 🔴 必须 |
+| nmap 进程卡死 | asyncio.wait_for 超时 + 孤儿进程清理 | 调用 | 🟡 重要 |
+| DB 连接超时 | 每组IP独立 session | 组 | 🟡 重要 |
+| 任务取消 | 取消信号 + 优雅退出 + 保存断点 | 阶段 | 🟡 重要 |
+| 周期任务重叠 | await 完成再 sleep + 信号量 | 任务 | 🔴 必须 |
+| 磁盘空间不足 | 扫描前检查 + 阈值告警 | 全局 | 🟢 可选 |
+| 单IP失败阻塞 | 单IP失败跳过，记录错误，不中断阶段 | IP | 🟡 重要 |
+
+### 11.14 数据库迁移
+
+```python
+# alembic/versions/xxx_add_checkpoint_fields.py
+
+def upgrade():
+    # ScanTask 新增字段
+    op.add_column('scan_tasks', sa.Column('current_phase', sa.Integer(), nullable=True, server_default='0'))
+    op.add_column('scan_tasks', sa.Column('last_duration_sec', sa.Integer(), nullable=True))
+    op.add_column('scan_tasks', sa.Column('smart_interval', sa.Boolean(), nullable=True, server_default='1'))
+    
+    # 创建 scan_checkpoints 独立表
+    op.create_table(
+        'scan_checkpoints',
+        sa.Column('id', sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column('task_id', sa.Integer(), sa.ForeignKey('scan_tasks.id'), nullable=False, index=True),
+        sa.Column('phase', sa.Integer(), nullable=False),
+        sa.Column('key', sa.String(64), nullable=False),
+        sa.Column('value', sa.JSON(), nullable=True),
+        sa.Column('updated_at', sa.DateTime()),
+        sa.UniqueConstraint('task_id', 'phase', 'key', name='uq_checkpoint_task_phase_key'),
+    )
+
+
+def downgrade():
+    op.drop_table('scan_checkpoints')
+    op.drop_column('scan_tasks', 'smart_interval')
+    op.drop_column('scan_tasks', 'last_duration_sec')
+    op.drop_column('scan_tasks', 'current_phase')
+```
+
+### 11.15 前端进度展示改造
+
+#### 11.15.1 任务详情页
+
+```
+┌─ 扫描任务 #42 ──────────────────────────────────────────┐
+│                                                          │
+│  状态: 执行中 ████████████░░░░░░ 68%                     │
+│                                                          │
+│  阶段进度:                                               │
+│  ├─ ✅ 阶段1: 端口发现       (523/523主机)  完成 22h15m  │
+│  ├─ 🔄 阶段2: 服务识别       (356/523主机)  执行中...    │
+│  │   当前: 192.168.3.120 (组 18/27)                      │
+│  ├─ ⏳ 阶段3: 脚本扫描       等待中                       │
+│  └─ ⏭ 阶段4: OS识别         跳过(未启用)                 │
+│                                                          │
+│  [暂停] [取消] [查看日志]                                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### 11.15.2 断点恢复提示
+
+```
+┌─ 扫描任务 #42 ──────────────────────────────────────────┐
+│                                                          │
+│  ⚠️ 上次扫描在阶段2中断（已完成 356/523 主机）            │
+│                                                          │
+│  [从断点恢复]  [重新开始]  [取消]                         │
+│                                                          │
+│  提示：从断点恢复将跳过已完成的356个主机，节省约16小时     │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### 11.15.3 API 扩展
+
+```python
+# GET /api/service-discovery/tasks/{task_id}/progress
+{
+    "task_id": 42,
+    "status": "running",
+    "progress": 68,
+    "current_phase": 2,
+    "phase_status": {
+        "phase1": {
+            "status": "completed",
+            "hosts_completed": 523,
+            "hosts_total": 523,
+            "duration_sec": 80100
+        },
+        "phase2": {
+            "status": "running",
+            "hosts_completed": 356,
+            "hosts_total": 523,
+            "current_group": "18/27"
+        },
+        "phase3": { "status": "pending" },
+        "phase4": { "status": "skipped" }
+    },
+    "checkpoint_info": {
+        "can_resume": true,
+        "phase1_completed_ips": 523,
+        "phase2_completed_ips": 356
+    },
+    "elapsed_sec": 97200,
+    "estimated_remaining_sec": 43200
+}
+```
+
+```python
+# POST /api/service-discovery/tasks/{task_id}/resume
+# 从断点恢复执行
+
+# POST /api/service-discovery/tasks/{task_id}/restart
+# 忽略断点，重新开始
+```
+
+### 11.16 依赖项新增
+
+```txt
+# requirements.txt 新增
+psutil>=5.9.0       # 进程管理（nmap 孤儿进程清理）
+```
+
+无需其他外部依赖，所有核心机制基于 asyncio + SQLAlchemy + SQLite 原生能力。
+
+### 11.17 实现优先级与里程碑
+
+| 阶段 | 内容 | 预估工时 | 依赖 |
+|------|------|----------|------|
+| **M1: 数据模型** | ScanTask 新增字段 + 迁移脚本 | 0.5天 | 无 |
+| **M2: 断点核心** | checkpoint 读写 + execute_scan 改造 + 阶段级恢复 | 2天 | M1 |
+| **M3: 阶段内断点** | IP/组粒度断点 + 阶段1 Ping/Top1000/全端口断点 | 2天 | M2 |
+| **M4: 重启恢复** | _recover_interrupted_tasks + 启动流程集成 | 0.5天 | M2 |
+| **M5: 内存优化** | 去掉 all_results + 结果直写DB + 汇总查询 | 1天 | M2 |
+| **M6: 进程保护** | nmap 超时 + 孤儿进程清理 | 0.5天 | M2 |
+| **M7: Session 管理** | 阶段/组粒度独立 session | 0.5天 | M5 |
+| **M8: 取消机制** | 取消信号 + 优雅退出 | 0.5天 | M2 |
+| **M9: 周期扫描** | scheduler 改造 + 智能间隔 | 1天 | M2+M4 |
+| **M10: 前端适配** | 进度展示 + 断点恢复UI + API | 2天 | M2-M9 |
+| **M11: 测试验证** | 模拟中断恢复 + 大规模压力测试 | 2天 | 全部 |
+
+**总计约 12.5 天**，核心路径 M1→M2→M3→M4→M5（约6天），其余可并行。
