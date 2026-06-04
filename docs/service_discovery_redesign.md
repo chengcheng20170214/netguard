@@ -1001,12 +1001,23 @@ class OSDetectConfig(BaseModel):
 
 
 class TimingConfig(BaseModel):
-    host_timeout: int = Field(0, ge=0, description="单主机超时(秒)，0=不限")
+    host_timeout: int = Field(0, ge=0, description="单主机超时(秒)，0=不限 → --host-timeout")
+    nmap_timeout_sec: int = Field(7200, ge=60, description="nmap进程整体超时(秒) → asyncio.wait_for 安全网")
+    script_timeout_sec: int = Field(60, ge=5, description="单NSE脚本超时(秒) → --script-timeout")
     max_retries: int = Field(3, ge=0, le=10)
     min_rate: int = Field(300, ge=1)
     max_rtt_timeout_ms: int = Field(500, ge=50)
     initial_rtt_timeout_ms: int = Field(200, ge=50)
     max_scan_delay_ms: int = Field(10, ge=1)
+
+    @model_validator(mode="after")
+    def validate_timeout_hierarchy(self) -> "TimingConfig":
+        """超时层次: script_timeout_sec < host_timeout < nmap_timeout_sec"""
+        if self.host_timeout > 0 and self.script_timeout_sec >= self.host_timeout:
+            raise ValueError(f"script_timeout_sec({self.script_timeout_sec}) 必须 < host_timeout({self.host_timeout})")
+        if self.host_timeout > 0 and self.host_timeout >= self.nmap_timeout_sec:
+            raise ValueError(f"host_timeout({self.host_timeout}) 必须 < nmap_timeout_sec({self.nmap_timeout_sec})")
+        return self
 
 
 class ScanProfileCreate(BaseModel):
