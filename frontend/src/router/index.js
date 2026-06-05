@@ -9,6 +9,7 @@ const routes = [
   { path: '/assets/:id', name: 'AssetDetail', component: () => import('../views/AssetDetail.vue'), meta: { requiresAuth: true } },
   { path: '/vulns', name: 'Vulns', component: () => import('../views/Vulns.vue'), meta: { requiresAuth: true } },
   { path: '/users', name: 'Users', component: () => import('../views/Users.vue'), meta: { requiresAuth: true, roles: ['admin'] } },
+  { path: '/scan-profiles', name: 'ScanProfiles', component: () => import('../views/ScanProfiles.vue'), meta: { requiresAuth: true, roles: ['admin'] } },
   { path: '/settings', name: 'Settings', component: () => import('../views/Settings.vue'), meta: { requiresAuth: true, roles: ['admin'] } }
 ]
 

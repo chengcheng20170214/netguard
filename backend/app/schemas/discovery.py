@@ -77,6 +77,7 @@ class ScanUpdateRequest(BaseModel):
     targets: str | None = None
     scan_mode: ScanMode | None = None
     scan_methods: list[ScanMethod] | None = None
+    scan_profile_id: int | None = None   # 新增：更新扫描策略
     ports: str | None = None
     max_concurrent: int | None = None
     interval_minutes: int | None = None
@@ -137,7 +138,7 @@ class ScanTaskResponse(BaseModel):
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
-    current_phase: int = 0              # 新增：当前阶段
+    current_phase: str = ""              # 新增：当前阶段(port_scan/service_and_script/os_detect)
     last_duration_sec: int | None = None # 新增：上次耗时
 
     model_config = {"from_attributes": True}

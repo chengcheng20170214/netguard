@@ -133,6 +133,8 @@ async def update_service_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSes
         task.ports = req.ports
     if req.max_concurrent is not None:
         task.max_concurrent = req.max_concurrent
+    if req.scan_profile_id is not None:
+        task.scan_profile_id = req.scan_profile_id
     if req.interval_minutes is not None:
         task.interval_minutes = req.interval_minutes
         if task.scan_type == ScanType.periodic and task.is_active:

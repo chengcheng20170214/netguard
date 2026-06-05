@@ -1184,7 +1184,7 @@ async def run_service_discovery(
             # 设置任务状态为 running
             scan_task.status = ScanStatus.running
             scan_task.started_at = scan_task.started_at or datetime.now(timezone.utc)
-            scan_task.current_phase = 1
+            scan_task.current_phase = "port_scan"
             await db.commit()
 
             targets = scan_task.targets

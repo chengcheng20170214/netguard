@@ -27,6 +27,10 @@
             <el-icon><Warning /></el-icon>
             <span>漏洞检测</span>
           </el-menu-item>
+          <el-menu-item v-if="user && user.role === 'admin'" index="/scan-profiles">
+            <el-icon><Operation /></el-icon>
+            <span>扫描策略</span>
+          </el-menu-item>
           <el-menu-item v-if="user && user.role === 'admin'" index="/users">
             <el-icon><User /></el-icon>
             <span>用户管理</span>
@@ -57,7 +61,7 @@
 <script setup>
 import { computed, ref, onMounted } from 'vue'
 import { useAuthStore } from './stores/auth'
-import { Monitor, Search, Files, Warning, User, Setting, Connection } from '@element-plus/icons-vue'
+import { Monitor, Search, Files, Warning, User, Setting, Connection, Operation } from '@element-plus/icons-vue'
 import api from './api/index'
 
 const authStore = useAuthStore()

@@ -91,8 +91,8 @@ class ScanTask(Base):
     # --- 服务发现重写：新增字段 ---
     scan_profile_id = Column(Integer, ForeignKey("scan_profiles.id"), nullable=True,
                               comment="关联扫描策略，NULL=旧模式走scan_methods")
-    current_phase = Column(Integer, default=0,
-                           comment="当前阶段: 0=未开始, 1=端口发现, 2=服务识别, 3=脚本扫描, 4=OS识别")
+    current_phase = Column(String(32), default="",
+                           comment="当前阶段: ''=未开始, port_scan, service_and_script, os_detect")
     last_duration_sec = Column(Integer, default=None,
                                comment="上次扫描耗时(秒)，用于智能间隔")
 

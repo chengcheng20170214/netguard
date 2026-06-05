@@ -21,3 +21,12 @@ export const deactivateServiceScan = (id) => api.post('/service-scans/' + id + '
 export const updateServiceScan = (id, data) => api.put('/service-scans/' + id, data)
 export const deleteServiceScan = (id) => api.delete('/service-scans/' + id)
 export const rescanServiceScan = (id) => api.post('/service-scans/' + id + '/rescan')
+
+// Scan profiles (扫描策略)
+export const getScanProfiles = (params) => api.get('/scan-profiles', { params })
+export const getScanProfilesBrief = () => api.get('/scan-profiles', { params: { brief: true } })
+export const getScanProfile = (id) => api.get('/scan-profiles/' + id)
+export const createScanProfile = (data) => api.post('/scan-profiles', data)
+export const updateScanProfile = (id, data) => api.put('/scan-profiles/' + id, data)
+export const deleteScanProfile = (id) => api.delete('/scan-profiles/' + id)
+export const setDefaultScanProfile = (id) => api.put('/scan-profiles/' + id + '/default')

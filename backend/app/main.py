@@ -82,6 +82,6 @@ app.include_router(sysconfig.router, prefix="/api")
 async def health():
     return {"status": "ok", "version": settings.APP_VERSION}
 
-frontend_dist = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
+frontend_dist = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "frontend", "dist")
 if os.path.isdir(frontend_dist):
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
