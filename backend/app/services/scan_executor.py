@@ -1301,7 +1301,7 @@ async def run_service_discovery(
             scan_task = await db.get(ScanTask, scan_task_id)
             if scan_task:
                 scan_task.status = ScanStatus.cancelled
-                scan_task.current_phase = "cancelled"
+                # 保留 current_phase 为被取消时的阶段名，便于用户了解进度
                 scan_task.completed_at = datetime.now(timezone.utc)
                 flag_modified(scan_task, "scan_log")
                 await db.commit()
