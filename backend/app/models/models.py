@@ -1,6 +1,6 @@
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum, Text, JSON, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum, Text, JSON, ForeignKey, Float, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -87,6 +87,17 @@ class ScanTask(Base):
     started_at = Column(DateTime, default=None)
     completed_at = Column(DateTime, default=None)
     created_at = Column(DateTime, default=_utcnow)
+
+    # --- 服务发现重写：新增字段 ---
+    scan_profile_id = Column(Integer, ForeignKey("scan_profiles.id"), nullable=True,
+                              comment="关联扫描策略，NULL=旧模式走scan_methods")
+    current_phase = Column(Integer, default=0,
+                           comment="当前阶段: 0=未开始, 1=端口发现, 2=服务识别, 3=脚本扫描, 4=OS识别")
+    last_duration_sec = Column(Integer, default=None,
+                               comment="上次扫描耗时(秒)，用于智能间隔")
+
+    # --- 关系 ---
+    profile = relationship("ScanProfile", backref="tasks", foreign_keys=[scan_profile_id])
 
 
 class ScanResult(Base):
@@ -255,3 +266,107 @@ class KnownService(Base):
     category = Column(String(50), default="other")
     risk = Column(String(20), default="low")
     description = Column(String(255), default=None)
+
+
+# ==============================================================================
+# 服务发现重写：ScanProfile（扫描策略配置）
+# ==============================================================================
+
+class ScanProfile(Base):
+    """扫描策略配置表 — 定义渐进式探测的各阶段参数
+
+    核心设计：端口发现(阶段1) → 服务识别(阶段2) → 脚本扫描(阶段3) → OS识别(阶段4)
+    每个阶段只对上一阶段发现的开放端口做定向探测，避免重复扫描全端口。
+    """
+    __tablename__ = "scan_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, unique=True)
+    description = Column(String(255), default=None)
+    is_default = Column(Boolean, default=False,
+                        comment="系统默认策略（新建任务时自动选中）")
+    is_builtin = Column(Boolean, default=False,
+                        comment="内置策略不可删除，可修改参数")
+
+    # ===== 阶段1: 端口发现（必须执行）=====
+    port_scan = Column(JSON, default=dict)
+    # {
+    #   "mode": "top1000" | "full" | "custom",
+    #   "custom_ports": "22,80,443,1-1000",   # mode=custom 时使用
+    #   "top_ports": 1000,                     # mode=top1000 时使用
+    #   "scan_mode": "standard" | "ip_sequential",
+    #   "max_concurrent": 4                    # 并发nmap进程数
+    # }
+
+    # ===== 阶段2: 服务版本识别（可选）=====
+    service_detect = Column(JSON, default=dict)
+    # {
+    #   "enabled": true,
+    #   "intensity": 7,          # --version-intensity 0-9
+    #   "all_ports": false       # --allports
+    # }
+
+    # ===== 阶段3: 脚本扫描（可选）=====
+    script_scan = Column(JSON, default=dict)
+    # {
+    #   "enabled": false,
+    #   "categories": ["default", "safe"],
+    #   "custom_scripts": "",
+    #   "script_args": ""
+    # }
+
+    # ===== 阶段4: OS识别（可选）=====
+    os_detect = Column(JSON, default=dict)
+    # {
+    #   "enabled": false,
+    #   "max_tries": 2,
+    #   "scan_guess": false
+    # }
+
+    # ===== 通用时序参数 =====
+    timing = Column(JSON, default=dict)
+    # {
+    #   "host_timeout": 300,       # 单主机超时(秒)，0=不限
+    #   "nmap_timeout_sec": 7200,  # nmap进程整体超时(秒)，Python层面安全网
+    #   "script_timeout_sec": 60,  # 单个NSE脚本超时(秒)
+    #   "max_retries": 3,
+    #   "min_rate": 300,
+    #   "max_rtt_timeout_ms": 500,
+    #   "initial_rtt_timeout_ms": 200,
+    #   "max_scan_delay_ms": 10,
+    #   "phase_executor": "grouped"  # "serial"=逐IP串行, "grouped"=分组并行
+    # }
+    #
+    # ★ 超时层次: script_timeout_sec << host_timeout << nmap_timeout_sec
+
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+# ==============================================================================
+# 服务发现重写：ScanCheckpoint（断点恢复数据独立表）
+# ==============================================================================
+
+class ScanCheckpoint(Base):
+    """断点数据独立表 — 按key粒度存储，避免大JSON全量写入
+
+    替代旧方案在 ScanTask 上存 checkpoint JSON 列。
+    优势：按key粒度更新，SQLite只写变化的那条记录，而非整个JSON。
+    """
+    __tablename__ = "scan_checkpoints"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(Integer, ForeignKey("scan_tasks.id"), nullable=False, index=True)
+    phase = Column(Integer, nullable=False,
+                   comment="阶段编号 (1=端口发现, 2=服务识别, 3=脚本扫描, 4=OS识别)")
+    key = Column(String(64), nullable=False,
+                 comment="键名，如 completed_ips/open_ports/status")
+    value = Column(JSON, nullable=True,
+                   comment="值（JSON格式，按key粒度更新）")
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("task_id", "phase", "key", name="uq_checkpoint_task_phase_key"),
+    )
+
+    scan_task = relationship("ScanTask", backref="checkpoints")

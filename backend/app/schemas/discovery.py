@@ -2,7 +2,7 @@ from datetime import datetime
 import ipaddress
 import re
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from app.models.models import ScanMode, ScanMethod, ScanStatus, ScanType, ScanCategory
 
 _TARGET_HOSTNAME_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$')
@@ -32,6 +32,7 @@ class ScanRequest(BaseModel):
     scan_type: ScanType = ScanType.one_time
     scan_mode: ScanMode = ScanMode.standard
     scan_methods: list[ScanMethod] = []  # 服务发现时填写，主机发现时忽略（固定两阶段）
+    scan_profile_id: int | None = None   # 新增：扫描策略ID，优先于 scan_methods
     ports: str | None = None
     max_concurrent: int = 4
 
@@ -42,6 +43,17 @@ class ScanRequest(BaseModel):
             raise ValueError("并发数必须在 1-16 之间")
         return v
     interval_minutes: int | None = None
+
+    @model_validator(mode="after")
+    def validate_profile_or_methods(self) -> "ScanRequest":
+        """新任务用 profile，旧任务用 methods，服务发现时两者至少有一个"""
+        if self.scan_profile_id:
+            # 有 profile 时忽略 scan_methods，由后端根据 profile 自动决定
+            pass
+        elif (self.scan_category == ScanCategory.service_discovery
+              and not self.scan_methods):
+            raise ValueError("服务发现任务必须指定扫描策略(scan_profile_id)或扫描方法(scan_methods)")
+        return self
 
     @field_validator("targets")
     @classmethod
@@ -111,6 +123,7 @@ class ScanTaskResponse(BaseModel):
     scan_type: ScanType = ScanType.one_time
     scan_mode: ScanMode
     scan_methods: list | None = None
+    scan_profile_id: int | None = None   # 新增：关联扫描策略
     ports: str | None = None
     max_concurrent: int = 4
     interval_minutes: int | None = None
@@ -124,6 +137,8 @@ class ScanTaskResponse(BaseModel):
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    current_phase: int = 0              # 新增：当前阶段
+    last_duration_sec: int | None = None # 新增：上次耗时
 
     model_config = {"from_attributes": True}
 
