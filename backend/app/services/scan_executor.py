@@ -1730,14 +1730,17 @@ async def persist_host_incremental(
                 for new_p in ports_data:
                     key = (new_p.get("port"), new_p.get("proto"))
                     if key in old_map:
-                        # 覆盖非空字段
+                        # 覆盖非空字段（空列表视为空，不覆盖）
                         old_p = old_map[key]
                         for k, v in new_p.items():
-                            if v not in (None, ""):
+                            if v not in (None, "") and v != []:
                                 old_p[k] = v
                     else:
                         old_map[key] = dict(new_p)
                 existing_sr.ports = list(old_map.values())
+                # SQLAlchemy JSON 列原地修改后需手动标记 dirty，否则 commit 不会写入
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(existing_sr, "ports")
         else:
             scan_result = ScanResult(
                 scan_task_id=scan_task_id,

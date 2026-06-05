@@ -530,7 +530,8 @@ class NmapScanner(BaseScanner):
                             p_port, p_proto, p_ip = int(m.group(1)), m.group(2), m.group(3)
                             stdout_ports.setdefault(p_ip, []).append({
                                 "port": p_port, "proto": p_proto,
-                                "service": "", "version": "",
+                                "service": "", "product": "", "version": "",
+                                "extrainfo": "", "cpe": "",
                             })
 
                     # 进度行 → 放入队列（1秒节流）
@@ -716,12 +717,23 @@ class NmapScanner(BaseScanner):
             for proto in host_data.all_protocols():
                 for port, port_data in host_data[proto].items():
                     if port_data.get("state") == "open":
-                        ports_list.append({
+                        port_entry = {
                             "port": int(port),
                             "proto": proto,
                             "service": port_data.get("name", ""),
+                            "product": port_data.get("product", ""),
                             "version": port_data.get("version", ""),
-                        })
+                            "extrainfo": port_data.get("extrainfo", ""),
+                            "cpe": port_data.get("cpe", ""),
+                        }
+                        # 提取 NSE 脚本输出
+                        scripts = port_data.get("script")
+                        if scripts and isinstance(scripts, dict):
+                            port_entry["scripts"] = [
+                                {"id": sid, "output": soutput}
+                                for sid, soutput in scripts.items()
+                            ]
+                        ports_list.append(port_entry)
 
             results.append({
                 "ip": ip,
@@ -770,12 +782,23 @@ class NmapScanner(BaseScanner):
             for proto in host_data.all_protocols():
                 for port, port_data in host_data[proto].items():
                     if port_data.get("state") == "open":
-                        ports_list.append({
+                        port_entry = {
                             "port": int(port),
                             "proto": proto,
                             "service": port_data.get("name", ""),
+                            "product": port_data.get("product", ""),
                             "version": port_data.get("version", ""),
-                        })
+                            "extrainfo": port_data.get("extrainfo", ""),
+                            "cpe": port_data.get("cpe", ""),
+                        }
+                        # 提取 NSE 脚本输出
+                        scripts = port_data.get("script")
+                        if scripts and isinstance(scripts, dict):
+                            port_entry["scripts"] = [
+                                {"id": sid, "output": soutput}
+                                for sid, soutput in scripts.items()
+                            ]
+                        ports_list.append(port_entry)
 
             results.append({
                 "ip": ip,
