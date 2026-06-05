@@ -1702,17 +1702,53 @@ async def persist_host_incremental(
                 changed = True
             asset.last_seen = datetime.now(timezone.utc)
 
-        # 写入 ScanResult
-        scan_result = ScanResult(
-            scan_task_id=scan_task_id,
-            ip=ip,
-            hostname=hostname,
-            mac=mac,
-            os=os_info,
-            os_match=os_match,
-            ports=ports_data,
+        # 写入/合并 ScanResult（同 task + ip 只保留一条，后续阶段结果覆盖/合并）
+        existing_sr_result = await db.execute(
+            select(ScanResult).where(
+                ScanResult.scan_task_id == scan_task_id,
+                ScanResult.ip == ip,
+            )
         )
-        db.add(scan_result)
+        existing_sr = existing_sr_result.scalar_one_or_none()
+
+        if existing_sr:
+            # 合并: 更新主机级字段（非空值覆盖）
+            if hostname:
+                existing_sr.hostname = hostname
+            if mac:
+                existing_sr.mac = mac
+            if os_info:
+                existing_sr.os = os_info
+            if os_match:
+                existing_sr.os_match = os_match
+            # 合并端口: 逐端口合并，新结果中非空字段覆盖旧值
+            if ports_data:
+                old_ports: list[dict] = existing_sr.ports or []
+                old_map = {
+                    (p.get("port"), p.get("proto")): p for p in old_ports
+                }
+                for new_p in ports_data:
+                    key = (new_p.get("port"), new_p.get("proto"))
+                    if key in old_map:
+                        # 覆盖非空字段
+                        old_p = old_map[key]
+                        for k, v in new_p.items():
+                            if v not in (None, ""):
+                                old_p[k] = v
+                    else:
+                        old_map[key] = dict(new_p)
+                existing_sr.ports = list(old_map.values())
+        else:
+            scan_result = ScanResult(
+                scan_task_id=scan_task_id,
+                ip=ip,
+                hostname=hostname,
+                mac=mac,
+                os=os_info,
+                os_match=os_match,
+                ports=ports_data,
+            )
+            db.add(scan_result)
 
         await db.commit()
 
