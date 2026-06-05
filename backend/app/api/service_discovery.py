@@ -68,6 +68,7 @@ async def create_service_scan(req: ScanRequest, db: AsyncSession = Depends(get_d
         name=req.name, targets=req.targets, scan_category=ScanCategory.service_discovery,
         scan_type=req.scan_type, scan_mode=req.scan_mode,
         scan_methods=[m.value for m in req.scan_methods],
+        scan_profile_id=req.scan_profile_id,  # 新引擎: 绑定扫描策略
         ports=req.ports, max_concurrent=req.max_concurrent, interval_minutes=req.interval_minutes,
         created_by=current_user.id, next_run=next_run,
         is_active=True
@@ -204,6 +205,9 @@ async def deactivate_service_scan(scan_id: int, db: AsyncSession = Depends(get_d
     task.next_run = None
     if task.status == ScanStatus.running:
         task.status = ScanStatus.cancelled
+        # 通知新引擎取消
+        from app.services.scan_executor import request_cancel
+        request_cancel(task.id)
     await db.commit()
     try:
         from app.services.scheduler import scheduler_service
@@ -237,6 +241,9 @@ async def delete_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), 
     # Delete scan chunks
     from app.models.models import ScanChunk
     await db.execute(sa_delete(ScanChunk).where(ScanChunk.scan_task_id == scan_id))
+    # Delete scan checkpoints (新引擎断点数据)
+    from app.models.models import ScanCheckpoint
+    await db.execute(sa_delete(ScanCheckpoint).where(ScanCheckpoint.task_id == scan_id))
     # Delete the task
     await db.delete(task)
     await db.commit()
@@ -275,6 +282,12 @@ async def rescan_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), 
     # Delete old scan chunks
     from app.models.models import ScanChunk
     await db.execute(sa_delete(ScanChunk).where(ScanChunk.scan_task_id == scan_id))
+    # Delete old scan checkpoints (新引擎断点数据)
+    from app.models.models import ScanCheckpoint
+    await db.execute(sa_delete(ScanCheckpoint).where(ScanCheckpoint.task_id == scan_id))
+    # Reset phase tracking
+    task.current_phase = None
+    task.last_duration_sec = None
     await db.commit()
     await db.refresh(task)
 
@@ -312,6 +325,38 @@ async def rescan_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), 
     return task
 
 
+@router.post("/{scan_id}/cancel", response_model=ScanTaskResponse)
+async def cancel_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Cancel a running scan task."""
+    result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
+    task = result.scalar_one_or_none()
+    if not task:
+        raise HTTPException(status_code=404, detail="扫描任务不存在")
+    if task.status != ScanStatus.running:
+        raise HTTPException(status_code=400, detail="只有运行中的任务才能取消")
+
+    # 通知新引擎取消
+    from app.services.scan_executor import request_cancel
+    request_cancel(task.id)
+
+    task.status = ScanStatus.cancelled
+    task.completed_at = datetime.now(timezone.utc)
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(task, "scan_log")
+    await db.commit()
+    await db.refresh(task)
+
+    # 停止周期调度
+    if task.scan_type == ScanType.periodic and task.is_active:
+        try:
+            from app.services.scheduler import scheduler_service
+            scheduler_service.remove_periodic_scan(task.id)
+        except Exception as e:
+            logger.error(f"Failed to remove periodic scan {task.id} after cancel: {e}")
+
+    return task
+
+
 @router.websocket("/ws/scan/{task_id}")
 async def scan_ws(websocket: WebSocket, task_id: int, token: str = Query(default="")):
     if not token:
@@ -333,6 +378,7 @@ async def scan_ws(websocket: WebSocket, task_id: int, token: str = Query(default
                         "progress": task.progress,
                         "scan_log": task.scan_log or [],
                         "result_summary": task.result_summary or {},
+                        "current_phase": task.current_phase,
                     })
                     if task.status.value in ("completed", "failed", "cancelled"):
                         break

@@ -1,4 +1,12 @@
+"""
+周期扫描调度器
 
+关键设计:
+- `await execute_scan(scan_task_id)` 阻塞等待扫描全部阶段完成后才返回
+- 确保一轮完成再开始下一轮（不会出现多轮重叠）
+- 扫描失败后等下一个周期再重试（不立即重试）
+- 每轮开始前检查任务是否仍然活跃
+"""
 from datetime import datetime, timezone, timedelta
 import asyncio
 import logging
@@ -12,6 +20,7 @@ class SchedulerService:
         self._running = False
 
     async def start(self):
+        """启动调度器，恢复所有活跃的周期扫描"""
         self._running = True
         from app.database import async_session
         from app.models.models import ScanTask, ScanType, ScanStatus
@@ -31,6 +40,7 @@ class SchedulerService:
         logger.info(f"Scheduler started with {len(self._periodic_tasks)} periodic scans")
 
     async def stop(self):
+        """停止调度器，取消所有周期任务"""
         self._running = False
         for task_id, atask in self._periodic_tasks.items():
             atask.cancel()
@@ -38,62 +48,96 @@ class SchedulerService:
         logger.info("Scheduler stopped")
 
     def add_periodic_scan(self, scan_task_id: int, interval_minutes: int):
+        """注册周期扫描任务"""
         if scan_task_id in self._periodic_tasks:
             self._periodic_tasks[scan_task_id].cancel()
         atask = asyncio.create_task(self._run_periodic(scan_task_id, interval_minutes))
         self._periodic_tasks[scan_task_id] = atask
+        logger.info(f"Registered periodic scan: task={scan_task_id}, interval={interval_minutes}min")
 
     def remove_periodic_scan(self, scan_task_id: int):
+        """移除周期扫描任务"""
         if scan_task_id in self._periodic_tasks:
             self._periodic_tasks[scan_task_id].cancel()
             del self._periodic_tasks[scan_task_id]
+            logger.info(f"Removed periodic scan: task={scan_task_id}")
 
     async def _run_periodic(self, scan_task_id: int, interval_minutes: int):
+        """周期扫描循环: 等待间隔 → 检查 → 执行 → 下一轮
+
+        关键: await execute_scan() 会阻塞等待全部阶段完成才返回，
+        因此不会出现多轮扫描重叠执行的问题。
+        """
         from app.database import async_session
         from app.models.models import ScanTask, ScanType, ScanStatus
         from app.services.scan_executor import execute_scan
         from sqlalchemy import select
 
         while self._running:
+            # 等待间隔
             await asyncio.sleep(interval_minutes * 60)
 
+            if not self._running:
+                break
+
+            # 检查任务是否仍然活跃
             try:
                 async with async_session() as db:
-                    result = await db.execute(select(ScanTask).where(ScanTask.id == scan_task_id))
+                    result = await db.execute(
+                        select(ScanTask).where(ScanTask.id == scan_task_id)
+                    )
                     task = result.scalar_one_or_none()
                     if not task or not task.is_active or task.scan_type != ScanType.periodic:
+                        logger.info(f"Periodic scan {scan_task_id} no longer active, stopping")
                         break
 
-                    next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
-                    task.next_run = next_run
+                    # 如果上一轮还在运行（理论上不会，因为 await 会等待），跳过本轮
+                    if task.status == ScanStatus.running:
+                        logger.warning(f"Periodic scan {scan_task_id} still running, skipping this round")
+                        continue
+
+                    # 记录预计下次执行时间
+                    task.next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
                     await db.commit()
 
-                await execute_scan(scan_task_id)
+            except Exception as e:
+                logger.error(f"Periodic scan {scan_task_id} pre-check failed: {e}")
+                continue
 
+            # 执行扫描（阻塞等待全部阶段完成）
+            scan_error = False
+            try:
+                logger.info(f"Periodic scan {scan_task_id}: starting round")
+                await execute_scan(scan_task_id)
+                logger.info(f"Periodic scan {scan_task_id}: round completed")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Periodic scan {scan_task_id} execution error: {e}")
+                scan_error = True
+
+            # 更新 last_run 和 next_run
+            try:
                 async with async_session() as db:
-                    result = await db.execute(select(ScanTask).where(ScanTask.id == scan_task_id))
+                    result = await db.execute(
+                        select(ScanTask).where(ScanTask.id == scan_task_id)
+                    )
                     task = result.scalar_one_or_none()
                     if task:
                         task.last_run = datetime.now(timezone.utc)
                         task.next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
-                        await db.commit()
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Periodic scan {scan_task_id} error: {e}")
-                try:
-                    async with async_session() as db:
-                        result = await db.execute(select(ScanTask).where(ScanTask.id == scan_task_id))
-                        task = result.scalar_one_or_none()
-                        if task and task.status == ScanStatus.running:
+                        if scan_error and task.status == ScanStatus.running:
                             task.status = ScanStatus.failed
-                            task.error_message = f"Periodic scan error: {e}"
-                            await db.commit()
-                except Exception:
-                    pass
+                            task.error_message = "Periodic scan execution error"
 
+                        await db.commit()
+            except Exception as e:
+                logger.error(f"Periodic scan {scan_task_id} post-update failed: {e}")
+
+        # 清理
         self._periodic_tasks.pop(scan_task_id, None)
+        logger.info(f"Periodic scan {scan_task_id} loop ended")
 
 
 scheduler_service = SchedulerService()

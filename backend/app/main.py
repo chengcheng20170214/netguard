@@ -35,6 +35,13 @@ async def lifespan(app: FastAPI):
         await scheduler_service.start()
     except Exception as e:
         logger.error(f"Failed to start scheduler: {e}")
+    # 恢复中断的扫描任务（断点续跑）
+    try:
+        from app.services.scan_executor import get_recovery_func
+        recover = get_recovery_func()
+        await recover()
+    except Exception as e:
+        logger.error(f"Failed to recover interrupted tasks: {e}")
     try:
         from app.services.vuln_service import vuln_scheduler
         await vuln_scheduler.start()
