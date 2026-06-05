@@ -153,6 +153,61 @@ def _merge_results(all_results: dict, new_results: list[dict]):
 
 
 class NmapScanner(BaseScanner):
+
+    async def scan_with_args(
+        self, targets: str, args: str | list[str],
+        timeout_sec: int = 0,
+    ) -> list[dict]:
+        """使用自定义参数执行 nmap 扫描。
+
+        新引擎核心接口：各阶段通过此方法执行自定义 nmap 命令。
+
+        Args:
+            targets: 扫描目标，如 "192.168.1.1" 或 "192.168.1.1 192.168.1.2"
+            args: nmap 参数，字符串或列表形式。
+                  例: "-sT -sV --version-intensity 7 -p 22,80,443 -Pn -n"
+                  或: ["-sT", "-sV", "--version-intensity", "7", "-p", "22,80,443", "-Pn", "-n"]
+            timeout_sec: 超时秒数，0 表示不限制。
+
+        Returns:
+            扫描结果列表，每项含 ip/mac/hostname/os/ports 等字段。
+            超时或执行失败返回空列表。
+        """
+        if isinstance(args, str):
+            cmd_args = shlex.split(args)
+        else:
+            cmd_args = list(args)
+
+        nmap_path = settings.NMAP_PATH
+        cmd = [nmap_path] + cmd_args + _split_targets(targets)
+
+        # 确保 -oX 输出 XML 用于解析
+        xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_phase_")
+        os.close(xml_fd)
+        cmd_with_xml = cmd + ["-oX", xml_path]
+
+        try:
+            # 同步执行（在线程池中，不阻塞事件循环）
+            result = await asyncio.to_thread(
+                self._run_nmap_sync,
+                cmd_with_xml, xml_path, "phase_scan",
+                queue.Queue(), 1, 0,  # noop_queue, attempt=1, max_retries=0
+            )
+
+            if result is None:
+                logger.warning(f"scan_with_args 返回 None: targets={targets}, args={args}")
+                return []
+
+            chunk_results, _, _ = result
+            return chunk_results
+
+        except Exception as e:
+            logger.error(f"scan_with_args 异常: targets={targets}, error={e}")
+            return []
+        finally:
+            if os.path.exists(xml_path):
+                os.unlink(xml_path)
+
     async def scan(self, targets: str, ports: str | None = None, **kwargs) -> list[dict]:
         targets = validate_targets(targets)
         scan_method = kwargs.get("scan_method", "nmap_syn")
