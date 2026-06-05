@@ -200,13 +200,49 @@
               <el-tag v-if="detailData.current_phase" type="warning" size="small">{{ phaseLabel(detailData.current_phase) }}</el-tag>
             </div>
           </div>
-          <el-table v-if="detailData" :data="detailData.results || []" stripe border>
+          <!-- 扫描结果表格：支持展开行查看端口详情 -->
+          <el-table v-if="detailData" :data="detailData.results || []" stripe border row-key="id"
+            :expand-row-keys="expandedResultRows" @expand-change="onResultExpand">
+            <el-table-column type="expand">
+              <template #default="{ row }">
+                <el-table :data="row.ports || []" size="small" border style="margin:4px 0 8px 48px;width:calc(100% - 56px)">
+                  <el-table-column prop="port" label="端口" width="70" />
+                  <el-table-column prop="proto" label="协议" width="70" />
+                  <el-table-column prop="service" label="服务" width="100" />
+                  <el-table-column prop="product" label="产品" min-width="120">
+                    <template #default="{ row: p }">{{ p.product || '-' }}</template>
+                  </el-table-column>
+                  <el-table-column prop="version" label="版本" min-width="150">
+                    <template #default="{ row: p }">{{ p.version || '-' }}</template>
+                  </el-table-column>
+                  <el-table-column prop="extrainfo" label="附加信息" min-width="150">
+                    <template #default="{ row: p }">{{ p.extrainfo || '-' }}</template>
+                  </el-table-column>
+                  <el-table-column prop="cpe" label="CPE" min-width="160">
+                    <template #default="{ row: p }">{{ p.cpe || '-' }}</template>
+                  </el-table-column>
+                  <el-table-column label="脚本" min-width="120">
+                    <template #default="{ row: p }">
+                      <template v-if="p.scripts && p.scripts.length">
+                        <el-tag v-for="(s, i) in p.scripts" :key="i" size="small" type="info" style="margin:2px">{{ s.id || s }}</el-tag>
+                      </template>
+                      <span v-else>-</span>
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </template>
+            </el-table-column>
             <el-table-column prop="ip" label="IP" width="150" />
             <el-table-column prop="hostname" label="主机名" width="150" />
-            <el-table-column prop="os" label="操作系统" width="150" />
+            <el-table-column prop="os" label="操作系统" width="150">
+              <template #default="{ row }">{{ row.os || row.os_match || '-' }}</template>
+            </el-table-column>
             <el-table-column label="开放端口" min-width="200">
               <template #default="{ row }">
-                <span v-for="p in (row.ports || [])" :key="p.port" style="margin-right:8px">{{ p.port }}/{{ p.service || p.proto }}</span>
+                <span v-for="p in (row.ports || [])" :key="p.port" style="margin-right:8px">
+                  {{ p.port }}/{{ p.service || p.proto }}
+                  <el-tag v-if="p.product" size="small" type="success" style="margin-left:2px;font-size:11px">{{ p.product }}</el-tag>
+                </span>
               </template>
             </el-table-column>
           </el-table>
@@ -267,6 +303,12 @@ const logContainerRef = ref(null)
 const profileOptions = ref([])           // brief list for dropdown
 const selectedProfileDetail = ref(null)  // full detail of selected profile
 const profileCache = ref({})             // id -> name cache for history table
+
+// 展开行控制
+const expandedResultRows = ref([])
+const onResultExpand = ({ id }, expandedRows) => {
+  expandedResultRows.value = expandedRows.map(r => r.id)
+}
 
 // Edit dialog state
 const editVisible = ref(false)
