@@ -11,6 +11,7 @@ class AssetResponse(BaseModel):
     mac: str | None = None
     hostname: str | None = None
     os: str | None = None
+    os_match: str | None = None
     current_ports: list | None = None
     tags: list | None = None
     group_name: str | None = None
@@ -42,6 +43,7 @@ class AssetSnapshotResponse(BaseModel):
     mac: str | None = None
     hostname: str | None = None
     os: str | None = None
+    os_match: str | None = None
     ports: list | None = None
     created_at: datetime | None = None
 

@@ -269,11 +269,12 @@ async def _update_phase_status(
 
     await _save_checkpoint(db, scan_task_id, phase, "status", existing_value)
 
-    # 同步 ScanTask.current_phase（轻量更新）
+    # 同步 ScanTask.current_phase（轻量更新，存阶段名称而非数字）
+    _phase_names = {1: "port_scan", 2: "service_scan", 3: "script_scan", 4: "os_detect"}
     async with _db_lock:
         scan_task = await db.get(ScanTask, scan_task_id)
         if scan_task:
-            scan_task.current_phase = phase
+            scan_task.current_phase = _phase_names.get(phase, str(phase))
             await db.commit()
 
 
@@ -592,7 +593,8 @@ async def _phase1_top1000(
                     for r in results:
                         r_ip = r.get("ip")
                         if r_ip and r.get("ports"):
-                            ip_ports = [p["port"] for p in r["ports"] if p.get("state") == "open"]
+                            # nmap_scanner 只返回开放端口，无需再过滤 state
+                            ip_ports = [p["port"] for p in r["ports"]]
                             if ip_ports:
                                 open_ports_map[r_ip] = ip_ports
                             # 直写DB
@@ -644,7 +646,8 @@ async def _phase1_top1000(
                 for r in results:
                     r_ip = r.get("ip")
                     if r_ip and r.get("ports"):
-                        ip_ports = [p["port"] for p in r["ports"] if p.get("state") == "open"]
+                        # nmap_scanner 只返回开放端口，无需再过滤 state
+                        ip_ports = [p["port"] for p in r["ports"]]
                         if ip_ports:
                             open_ports_map[r_ip] = ip_ports
                         async with async_session() as db:
@@ -757,9 +760,9 @@ async def _phase1_full_scan(
                         await persist_host_incremental(db, scan_task_id, r_ip, r)
                         # 汇总开放端口
                         if r.get("ports"):
+                            # nmap_scanner 只返回开放端口，无需再过滤 state
                             ip_open = [p["port"] for p in r["ports"]
-                                       if p.get("state") == "open"
-                                       and chunk.port_start <= p["port"] <= chunk.port_end]
+                                       if chunk.port_start <= p["port"] <= chunk.port_end]
                             if ip_open:
                                 if r_ip not in open_ports_map:
                                     open_ports_map[r_ip] = []
@@ -833,7 +836,8 @@ async def _phase1_custom(
                     for r in results:
                         r_ip = r.get("ip")
                         if r_ip and r.get("ports"):
-                            ip_ports = [p["port"] for p in r["ports"] if p.get("state") == "open"]
+                            # nmap_scanner 只返回开放端口，无需再过滤 state
+                            ip_ports = [p["port"] for p in r["ports"]]
                             if ip_ports:
                                 open_ports_map[r_ip] = ip_ports
                             async with async_session() as db:
@@ -869,7 +873,8 @@ async def _phase1_custom(
                 for r in results:
                     r_ip = r.get("ip")
                     if r_ip and r.get("ports"):
-                        ip_ports = [p["port"] for p in r["ports"] if p.get("state") == "open"]
+                        # nmap_scanner 只返回开放端口，无需再过滤 state
+                        ip_ports = [p["port"] for p in r["ports"]]
                         if ip_ports:
                             open_ports_map[r_ip] = ip_ports
                         async with async_session() as db:
@@ -901,7 +906,8 @@ async def _collect_open_ports_from_results(
     open_ports_map: dict[str, list[int]] = {}
     for ip, ports in result.all():
         if ip and ports:
-            open_ports = [p["port"] for p in ports if p.get("state") == "open"]
+            # nmap_scanner 只返回开放端口，无需再过滤 state
+            open_ports = [p["port"] for p in ports]
             if open_ports:
                 if ip not in open_ports_map:
                     open_ports_map[ip] = []
@@ -1283,6 +1289,7 @@ async def run_service_discovery(
             scan_task = await db.get(ScanTask, scan_task_id)
             if scan_task:
                 scan_task.last_duration_sec = int(duration)
+                scan_task.current_phase = "completed"
                 await _complete_scan_task(db, scan_task)
 
         await _append_log_to_task(scan_task_id,
@@ -1294,6 +1301,7 @@ async def run_service_discovery(
             scan_task = await db.get(ScanTask, scan_task_id)
             if scan_task:
                 scan_task.status = ScanStatus.cancelled
+                scan_task.current_phase = "cancelled"
                 scan_task.completed_at = datetime.now(timezone.utc)
                 flag_modified(scan_task, "scan_log")
                 await db.commit()

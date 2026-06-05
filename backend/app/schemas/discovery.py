@@ -150,6 +150,7 @@ class ScanResultResponse(BaseModel):
     mac: str | None = None
     hostname: str | None = None
     os: str | None = None
+    os_match: str | None = None
     ports: list | None = None
     created_at: datetime | None = None
 

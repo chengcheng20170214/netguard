@@ -109,6 +109,7 @@ class ScanResult(Base):
     mac = Column(String(17), default=None)
     hostname = Column(String(255), default=None)
     os = Column(String(255), default=None)
+    os_match = Column(String(255), default=None)  # OS识别详细匹配信息
     ports = Column(JSON, default=list)
     raw_output = Column(Text, default=None)
     created_at = Column(DateTime, default=_utcnow)
@@ -125,6 +126,7 @@ class Asset(Base):
     mac = Column(String(17), default=None)
     hostname = Column(String(255), default=None)
     os = Column(String(255), default=None)
+    os_match = Column(String(255), default=None)  # OS识别详细匹配信息
     current_ports = Column(JSON, default=list)
     tags = Column(JSON, default=list)
     group_name = Column(String(100), default=None)
@@ -144,6 +146,7 @@ class AssetSnapshot(Base):
     mac = Column(String(17), default=None)
     hostname = Column(String(255), default=None)
     os = Column(String(255), default=None)
+    os_match = Column(String(255), default=None)  # OS识别详细匹配信息
     ports = Column(JSON, default=list)
     created_at = Column(DateTime, default=_utcnow)
 
