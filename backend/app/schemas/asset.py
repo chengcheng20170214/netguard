@@ -21,6 +21,10 @@ class AssetResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+class AssetListResponse(BaseModel):
+    total: int
+    items: list[AssetResponse]
+
 class AssetUpdate(BaseModel):
     tags: list | None = None
     group_name: str | None = None

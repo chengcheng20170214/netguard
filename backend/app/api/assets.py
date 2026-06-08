@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.database import get_db
 from app.models.models import Asset, AssetChange, AssetSnapshot, User, KnownService
-from app.schemas.asset import AssetUpdate, AssetChangeResponse, AssetSnapshotResponse, AssetImportItem, KnownServiceCreate, KnownServiceResponse
+from app.schemas.asset import AssetResponse, AssetListResponse, AssetUpdate, AssetChangeResponse, AssetSnapshotResponse, AssetImportItem, KnownServiceCreate, KnownServiceResponse
 from app.middleware.auth import get_current_user
 import json, io, csv, ipaddress, logging
 
@@ -14,19 +14,74 @@ MAX_IMPORT_SIZE = 5 * 1024 * 1024
 
 router = APIRouter(prefix="/assets", tags=["资产管理"])
 
-@router.get("/")
-async def list_assets(ip: str | None = None, group: str | None = None, is_online: bool | None = None, skip: int = 0, limit: int = 50, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+@router.get("", response_model=AssetListResponse)
+async def list_assets(
+    ip: str | None = None,
+    hostname: str | None = None,
+    mac: str | None = None,
+    os: str | None = None,
+    group: str | None = None,
+    fingerprint: str | None = None,
+    is_online: bool | None = None,
+    sort_by: str = "last_seen",
+    sort_order: str = "desc",
+    skip: int = 0,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     query = select(Asset)
     if ip:
         query = query.where(Asset.ip.contains(ip))
+    if hostname:
+        query = query.where(Asset.hostname.contains(hostname))
+    if mac:
+        query = query.where(Asset.mac.contains(mac))
+    if os:
+        query = query.where(Asset.os.contains(os))
     if group:
         query = query.where(Asset.group_name == group)
+    if fingerprint:
+        query = query.where(Asset.fingerprint.contains(fingerprint))
     if is_online is not None:
         query = query.where(Asset.is_online == is_online)
-    total_q = await db.execute(select(func.count()).select_from(Asset))
-    total = total_q.scalar()
-    result = await db.execute(query.order_by(Asset.last_seen.desc()).offset(skip).limit(limit))
-    assets = result.scalars().all()
+
+    # 排序
+    allowed_sort = {
+        "ip": Asset.ip,
+        "hostname": Asset.hostname,
+        "mac": Asset.mac,
+        "os": Asset.os,
+        "group_name": Asset.group_name,
+        "fingerprint": Asset.fingerprint,
+        "first_seen": Asset.first_seen,
+        "last_seen": Asset.last_seen,
+    }
+    sort_col = allowed_sort.get(sort_by, Asset.last_seen)
+
+    if sort_by == "ip":
+        # IP 数值排序：SQLite 字符串排序 10 < 2，需 Python 侧处理
+        # 先查全量匹配结果（资产量级有限），排序后手动分页
+        total_q = await db.execute(select(func.count()).select_from(query.subquery()))
+        total = total_q.scalar()
+        result = await db.execute(query)
+        assets = result.scalars().all()
+
+        from ipaddress import ip_address as _ip
+        def _ip_key(a):
+            try:
+                return int(_ip(a.ip))
+            except (ValueError, TypeError):
+                return 0
+        assets.sort(key=_ip_key, reverse=(sort_order == "desc"))
+        assets = assets[skip: skip + limit]
+    else:
+        query = query.order_by(sort_col.desc() if sort_order == "desc" else sort_col.asc())
+        total_q = await db.execute(select(func.count()).select_from(query.subquery()))
+        total = total_q.scalar()
+        result = await db.execute(query.offset(skip).limit(limit))
+        assets = result.scalars().all()
+
     return {"total": total, "items": assets}
 
 @router.get("/targets")
@@ -43,7 +98,23 @@ async def all_changes(skip: int = 0, limit: int = 50, db: AsyncSession = Depends
     changes = result.scalars().all()
     return {"items": changes}
 
-@router.get("/{asset_id}")
+@router.post("/batch-delete")
+async def batch_delete_assets(ids: list[int], db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """批量删除资产"""
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    result = await db.execute(select(Asset).where(Asset.id.in_(ids)))
+    assets = result.scalars().all()
+    found_ids = {a.id for a in assets}
+    missing = set(ids) - found_ids
+    if missing:
+        raise HTTPException(status_code=404, detail=f"资产不存在: {missing}")
+    for a in assets:
+        await db.delete(a)
+    await db.commit()
+    return {"message": f"已删除 {len(assets)} 个资产"}
+
+@router.get("/{asset_id}", response_model=AssetResponse)
 async def get_asset(asset_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     result = await db.execute(select(Asset).where(Asset.id == asset_id))
     asset = result.scalar_one_or_none()
@@ -145,7 +216,7 @@ async def import_assets(file: UploadFile = File(...), db: AsyncSession = Depends
     return {"message": f"已导入 {count} 个资产", "skipped": skipped}
 
 
-@router.get("/services/", response_model=list[KnownServiceResponse])
+@router.get("/services", response_model=list[KnownServiceResponse])
 async def list_known_services(category: str | None = None, risk: str | None = None, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     query = select(KnownService).order_by(KnownService.port)
     if category:
@@ -156,7 +227,7 @@ async def list_known_services(category: str | None = None, risk: str | None = No
     return result.scalars().all()
 
 
-@router.post("/services/", response_model=KnownServiceResponse)
+@router.post("/services", response_model=KnownServiceResponse)
 async def create_known_service(data: KnownServiceCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     svc = KnownService(**data.model_dump())
     db.add(svc)

@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum, Text, JSON, ForeignKey, Float, UniqueConstraint
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from app.database import Base
 
 
@@ -140,7 +140,7 @@ class AssetSnapshot(Base):
     __tablename__ = "asset_snapshots"
 
     id = Column(Integer, primary_key=True, index=True)
-    asset_id = Column(Integer, ForeignKey("assets.id"), nullable=False)
+    asset_id = Column(Integer, ForeignKey("assets.id", ondelete="CASCADE"), nullable=False)
     scan_task_id = Column(Integer, ForeignKey("scan_tasks.id"), default=None)
     ip = Column(String(45), nullable=False, index=True)
     mac = Column(String(17), default=None)
@@ -150,7 +150,7 @@ class AssetSnapshot(Base):
     ports = Column(JSON, default=list)
     created_at = Column(DateTime, default=_utcnow)
 
-    asset = relationship("Asset", backref="snapshots")
+    asset = relationship("Asset", backref=backref("snapshots", cascade="all, delete-orphan"))
 
 
 class ChangeType(str, enum.Enum):
@@ -175,7 +175,7 @@ class AssetChange(Base):
     __tablename__ = "asset_changes"
 
     id = Column(Integer, primary_key=True, index=True)
-    asset_id = Column(Integer, ForeignKey("assets.id"), nullable=False)
+    asset_id = Column(Integer, ForeignKey("assets.id", ondelete="CASCADE"), nullable=False)
     ip = Column(String(45), nullable=False, index=True)
     change_type = Column(Enum(ChangeType), nullable=False)
     detail = Column(JSON, nullable=False)
@@ -184,14 +184,14 @@ class AssetChange(Base):
     severity = Column(Enum(ChangeSeverity), default=ChangeSeverity.info)
     detected_at = Column(DateTime, default=_utcnow)
 
-    asset = relationship("Asset", backref="changes")
+    asset = relationship("Asset", backref=backref("changes", cascade="all, delete-orphan"))
 
 
 class Vulnerability(Base):
     __tablename__ = "vulnerabilities"
 
     id = Column(Integer, primary_key=True, index=True)
-    asset_id = Column(Integer, ForeignKey("assets.id"), nullable=False)
+    asset_id = Column(Integer, ForeignKey("assets.id", ondelete="CASCADE"), nullable=False)
     cve_id = Column(String(20), nullable=False, index=True)
     cve_description = Column(Text, default=None)
     cvss_score = Column(Float, default=None)
@@ -205,7 +205,7 @@ class Vulnerability(Base):
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
-    asset = relationship("Asset", backref="vulnerabilities")
+    asset = relationship("Asset", backref=backref("vulnerabilities", cascade="all, delete-orphan"))
 
 
 class SystemConfig(Base):
