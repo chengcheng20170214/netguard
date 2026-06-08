@@ -59,10 +59,24 @@
                 <el-tag size="small" :type="selectedProfileDetail.os_detect?.enabled ? 'warning' : 'info'">
                   {{ selectedProfileDetail.os_detect?.enabled ? '启用' : '未启用' }}
                 </el-tag>
+                <el-tooltip v-if="selectedProfileDetail.os_detect?.enabled && !capabilities.os_detect_available" :content="capabilities.os_detect_reason || '需要root权限'" placement="top">
+                  <el-tag size="small" type="danger" style="margin-left:6px">⚠ 不可用</el-tag>
+                </el-tooltip>
               </el-descriptions-item>
             </el-descriptions>
           </div>
           <div v-else style="margin-top:4px;color:#909399;font-size:12px">选择策略后显示详细配置</div>
+          <el-alert
+            v-if="selectedProfileDetail?.os_detect?.enabled && !capabilities.os_detect_available"
+            type="warning"
+            :closable="false"
+            style="margin-top:8px"
+          >
+            <template #title>
+              OS 识别不可用：{{ capabilities.os_detect_reason || '需要root权限' }}。
+              请前往<router-link to="/settings" style="color:#E6A23C;text-decoration:underline">系统设置 → 扫描提权</router-link>配置 sudo 密码
+            </template>
+          </el-alert>
         </el-form-item>
         <el-form-item label="扫描类型" prop="scan_type">
           <el-radio-group v-model="scanForm.scan_type">
@@ -283,7 +297,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, nextTick } from 'vue'
-import { createServiceScan, getServiceScans, getServiceScanDetail, cancelServiceScan, activateServiceScan, deactivateServiceScan, updateServiceScan, deleteServiceScan, rescanServiceScan, getScanProfilesBrief, getScanProfile } from '../api/discovery'
+import { createServiceScan, getServiceScans, getServiceScanDetail, cancelServiceScan, activateServiceScan, deactivateServiceScan, updateServiceScan, deleteServiceScan, rescanServiceScan, getScanProfilesBrief, getScanProfile, getScanCapabilities } from '../api/discovery'
 import { getAssetTargets } from '../api/assets'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Setting } from '@element-plus/icons-vue'
@@ -303,6 +317,13 @@ const logContainerRef = ref(null)
 const profileOptions = ref([])           // brief list for dropdown
 const selectedProfileDetail = ref(null)  // full detail of selected profile
 const profileCache = ref({})             // id -> name cache for history table
+
+// Scan capabilities (for OS detect availability)
+const capabilities = ref({
+  nmap_available: true,
+  os_detect_available: true,
+  os_detect_reason: null,
+})
 
 // 展开行控制
 const expandedResultRows = ref([])
@@ -614,7 +635,17 @@ onMounted(() => {
   fetchProfiles()
   fetchAssetTargets()
   fetchScans()
+  fetchCapabilities()
 })
+
+const fetchCapabilities = async () => {
+  try {
+    const res = await getScanCapabilities()
+    capabilities.value = res.data
+  } catch (e) {
+    // 忽略 — 可能无权限
+  }
+}
 
 onUnmounted(() => {
   stopAutoRefresh()

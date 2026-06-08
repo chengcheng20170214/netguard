@@ -149,9 +149,20 @@
 
         <el-divider content-position="left">阶段4: OS识别</el-divider>
         <el-form-item label="启用">
-          <el-switch v-model="form.os_detect.enabled" />
+          <el-switch v-model="form.os_detect.enabled" :disabled="form.os_detect.enabled && !capabilities.os_detect_available" />
           <span v-if="form.os_detect.enabled" style="margin-left:8px;color:#E6A23C;font-size:12px">⚠️ 需要 root 权限</span>
         </el-form-item>
+        <el-alert
+          v-if="form.os_detect.enabled && !capabilities.os_detect_available"
+          type="warning"
+          :closable="false"
+          style="margin-bottom:12px"
+        >
+          <template #title>
+            OS 识别当前不可用：{{ capabilities.os_detect_reason || '需要root权限' }}。
+            请前往<router-link to="/settings" style="color:#E6A23C;text-decoration:underline">系统设置 → 扫描提权</router-link>配置 sudo 密码
+          </template>
+        </el-alert>
         <template v-if="form.os_detect.enabled">
           <el-form-item label="最大尝试">
             <el-input-number v-model="form.os_detect.max_tries" :min="1" :max="10" />
@@ -236,7 +247,7 @@
 
 <script setup>
 import { ref, reactive, onMounted } from 'vue'
-import { getScanProfiles, getScanProfile, createScanProfile, updateScanProfile, deleteScanProfile, setDefaultScanProfile } from '../api/discovery'
+import { getScanProfiles, getScanProfile, createScanProfile, updateScanProfile, deleteScanProfile, setDefaultScanProfile, getScanCapabilities } from '../api/discovery'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Check, Close, Star } from '@element-plus/icons-vue'
 
@@ -247,6 +258,9 @@ const isEdit = ref(false)
 const formRef = ref(null)
 const detailVisible = ref(false)
 const detailData = ref(null)
+
+// Scan capabilities for OS detect availability
+const capabilities = ref({ os_detect_available: true, os_detect_reason: null })
 
 // NSE script categories
 const recommendedCategories = [
@@ -405,7 +419,17 @@ const handleDelete = async (row) => {
 
 onMounted(() => {
   fetchProfiles()
+  fetchCapabilities()
 })
+
+const fetchCapabilities = async () => {
+  try {
+    const res = await getScanCapabilities()
+    capabilities.value = res.data
+  } catch (e) {
+    // 忽略
+  }
+}
 </script>
 
 <style scoped>

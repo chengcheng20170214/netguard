@@ -157,6 +157,8 @@ class NmapScanner(BaseScanner):
     async def scan_with_args(
         self, targets: str, args: str | list[str],
         timeout_sec: int = 0,
+        use_sudo: bool = False,
+        sudo_password: str | None = None,
     ) -> list[dict]:
         """使用自定义参数执行 nmap 扫描。
 
@@ -168,6 +170,8 @@ class NmapScanner(BaseScanner):
                   例: "-sT -sV --version-intensity 7 -p 22,80,443 -Pn -n"
                   或: ["-sT", "-sV", "--version-intensity", "7", "-p", "22,80,443", "-Pn", "-n"]
             timeout_sec: 超时秒数，0 表示不限制。
+            use_sudo: 是否通过 sudo 提权执行（用于 OS 识别等需要 root 的操作）
+            sudo_password: sudo 密码（use_sudo=True 时通过 stdin 传入）
 
         Returns:
             扫描结果列表，每项含 ip/mac/hostname/os/ports 等字段。
@@ -181,22 +185,39 @@ class NmapScanner(BaseScanner):
         nmap_path = settings.NMAP_PATH
         cmd = [nmap_path] + cmd_args + _split_targets(targets)
 
+        # sudo 提权：在命令前加 sudo -S（通过 stdin 读取密码）
+        if use_sudo:
+            sudo_prefix = ["sudo", "-S", "-k"]
+            # -S: 从 stdin 读取密码; -k: 强制重新验证（不使用缓存）
+            cmd = sudo_prefix + cmd
+
         # 确保 -oX 输出 XML 用于解析
         xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", prefix="netguard_phase_")
         os.close(xml_fd)
         cmd_with_xml = cmd + ["-oX", xml_path]
 
         try:
-            # 同步执行（在线程池中，不阻塞事件循环）
-            result = await asyncio.to_thread(
-                self._run_nmap_sync,
-                cmd_with_xml, xml_path, "phase_scan",
-                queue.Queue(), 1, 0,  # noop_queue, attempt=1, max_retries=0
-            )
+            if use_sudo and sudo_password:
+                # sudo 模式：通过 stdin 传入密码，直接执行命令
+                result = await asyncio.to_thread(
+                    self._run_nmap_sudo_sync,
+                    cmd_with_xml, xml_path, sudo_password,
+                )
+            else:
+                # 同步执行（在线程池中，不阻塞事件循环）
+                result = await asyncio.to_thread(
+                    self._run_nmap_sync,
+                    cmd_with_xml, xml_path, "phase_scan",
+                    queue.Queue(), 1, 0,  # noop_queue, attempt=1, max_retries=0
+                )
 
             if result is None:
                 logger.warning(f"scan_with_args 返回 None: targets={targets}, args={args}")
                 return []
+
+            if use_sudo and sudo_password:
+                # _run_nmap_sudo_sync 直接返回 results list
+                return result
 
             chunk_results, _, _ = result
             return chunk_results
@@ -478,6 +499,47 @@ class NmapScanner(BaseScanner):
     # nmap -v 可能输出: "Discovered open port 25/tcp on 129.28.10.53" 或
     # "Discovered open port 25/tcp on 129.28.10.53 (12234)" (带反向DNS或进程信息)
     _OPEN_PORT_RE = re.compile(r"^Discovered open port (\d+)/(tcp|udp) on (\S+?)(?:\s|$)")
+
+    def _run_nmap_sudo_sync(
+        self, cmd: list[str], xml_path: str, sudo_password: str,
+    ) -> list[dict] | None:
+        """sudo 模式同步执行 nmap：通过 stdin 传入密码。
+
+        简化版 _run_nmap_sync，不做进度回调，专用于 OS 识别等需 root 权限的短时扫描。
+
+        Args:
+            cmd: 完整命令列表（已含 sudo -S -k nmap ... -oX xml_path）
+            xml_path: XML 输出文件路径
+            sudo_password: sudo 密码明文
+
+        Returns:
+            扫描结果列表，失败返回 None
+        """
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=sudo_password + "\n",
+                capture_output=True, text=True, timeout=300,
+            )
+            if proc.returncode != 0:
+                stderr = proc.stderr.strip()
+                # sudo 密码错误特殊处理
+                if "incorrect password" in stderr.lower() or "sorry" in stderr.lower():
+                    logger.error(f"sudo 密码错误: {stderr}")
+                else:
+                    logger.warning(f"sudo nmap 执行失败 (rc={proc.returncode}): {stderr}")
+                # 即使 nmap 返回非零，XML 可能仍有部分结果
+                results = self._parse_xml_results(xml_path)
+                return results if results else None
+
+            return self._parse_xml_results(xml_path)
+
+        except subprocess.TimeoutExpired:
+            logger.warning("sudo nmap 执行超时 (300s)")
+            return None
+        except Exception as e:
+            logger.error(f"sudo nmap 执行异常: {e}")
+            return None
 
     def _run_nmap_sync(
         self, cmd: list[str], xml_path: str, label: str,

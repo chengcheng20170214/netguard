@@ -360,6 +360,8 @@ async def _run_nmap_with_timeout(
     scan_task_id: int = 0,
     db: AsyncSession | None = None,
     scan_task: ScanTask | None = None,
+    use_sudo: bool = False,
+    sudo_password: str | None = None,
 ) -> list[dict]:
     """带超时的 nmap 执行，防止进程卡死
 
@@ -370,6 +372,8 @@ async def _run_nmap_with_timeout(
         scan_task_id: 任务ID（用于日志和进程清理）
         db: 数据库 session（用于写日志）
         scan_task: ScanTask 对象（用于写日志）
+        use_sudo: 是否通过 sudo 提权执行
+        sudo_password: sudo 密码（use_sudo=True 时必填）
 
     Returns:
         扫描结果列表
@@ -383,11 +387,13 @@ async def _run_nmap_with_timeout(
     try:
         if timeout_sec > 0:
             results = await asyncio.wait_for(
-                scanner.scan_with_args(targets, args, timeout_sec=0),
+                scanner.scan_with_args(targets, args, timeout_sec=0,
+                                       use_sudo=use_sudo, sudo_password=sudo_password),
                 timeout=timeout_sec,
             )
         else:
-            results = await scanner.scan_with_args(targets, args, timeout_sec=0)
+            results = await scanner.scan_with_args(targets, args, timeout_sec=0,
+                                                    use_sudo=use_sudo, sudo_password=sudo_password)
 
         return results
 
@@ -1012,6 +1018,8 @@ async def _phase23_service_and_script_with_checkpoint(
             results = await _run_nmap_with_timeout(
                 ip, args, timeout_sec=nmap_timeout,
                 scan_task_id=scan_task_id,
+                use_sudo=use_sudo,
+                sudo_password=sudo_password,
             )
 
             for r in results:
@@ -1066,7 +1074,9 @@ async def _phase4_os_detect_with_checkpoint(
 ):
     """阶段4: OS识别，带IP粒度断点
 
-    注意: OS识别(-O)需要root权限，否则nmap会跳过
+    注意: OS识别(-O)需要root权限。当非root运行时：
+      - 若 NMAP_SUDO_ENABLED=True 且已配置 sudo 密码 → 通过 sudo -S 提权执行
+      - 否则 → 跳过阶段4，记录日志
     """
     os_config = profile.os_detect or {}
     timing = profile.timing or {}
@@ -1075,6 +1085,50 @@ async def _phase4_os_detect_with_checkpoint(
     if not os_config.get("enabled", False):
         await _append_log_to_task(scan_task_id, "阶段4 OS识别未启用，跳过")
         return
+
+    # ── 权限检测 ──
+    import os as _os
+    is_root = False
+    try:
+        is_root = _os.geteuid() == 0
+    except AttributeError:
+        pass
+
+    use_sudo = False
+    sudo_password = None
+
+    if not is_root:
+        if settings.NMAP_SUDO_ENABLED:
+            # 从数据库读取加密的 sudo 密码
+            try:
+                from app.api.scan_capabilities import decrypt_sudo_password, _get_sudo_password_encrypted
+                async with async_session() as _db:
+                    encrypted = await _get_sudo_password_encrypted(_db)
+                if encrypted:
+                    sudo_password = decrypt_sudo_password(encrypted)
+                    if sudo_password:
+                        use_sudo = True
+                    else:
+                        await _append_log_to_task(scan_task_id,
+                            "⚠️ sudo 密码解密失败，无法提权执行 OS 识别，跳过阶段4")
+                        return
+                else:
+                    await _append_log_to_task(scan_task_id,
+                        "⚠️ sudo 已启用但未配置密码，无法提权执行 OS 识别，跳过阶段4")
+                    return
+            except Exception as e:
+                await _append_log_to_task(scan_task_id,
+                    f"⚠️ 读取 sudo 密码失败: {e}，跳过阶段4")
+                return
+        else:
+            await _append_log_to_task(scan_task_id,
+                "⚠️ OS识别(-O)需要root权限，当前非root且未启用sudo提权，跳过阶段4")
+            return
+    else:
+        await _append_log_to_task(scan_task_id, "阶段4 OS识别: 当前以root权限运行")
+
+    if use_sudo:
+        await _append_log_to_task(scan_task_id, "阶段4 OS识别: 将通过 sudo 提权执行")
 
     # 从断点恢复
     async with async_session() as db:
@@ -1107,6 +1161,8 @@ async def _phase4_os_detect_with_checkpoint(
             results = await _run_nmap_with_timeout(
                 ip, args, timeout_sec=nmap_timeout,
                 scan_task_id=scan_task_id,
+                use_sudo=use_sudo,
+                sudo_password=sudo_password,
             )
 
             for r in results:

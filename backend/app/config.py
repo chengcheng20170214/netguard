@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     # Scanner paths
     NMAP_PATH: str = os.getenv("NMAP_PATH", "/usr/bin/nmap")
 
+    # --- 加密密钥 (用于加密存储 sudo 密码等敏感配置) ---
+    # 机器绑定: ENCRYPT_KEY + /etc/machine-id → PBKDF2 → AES-256 密钥
+    # 空值时首次访问自动生成并写入 .env
+    ENCRYPT_KEY: str = os.getenv("ENCRYPT_KEY", "")
+
+    # --- sudo 提权配置 ---
+    # 启用后，nmap 执行 OS 识别等需要 root 权限的操作时通过 sudo 提权
+    NMAP_SUDO_ENABLED: bool = os.getenv("NMAP_SUDO_ENABLED", "false").lower() == "true"
+
     # TCP端口扫描参数（无需root权限，全部使用 -sT）
     SCAN_CHUNK_SIZE: int = int(os.getenv("SCAN_CHUNK_SIZE", "5000"))  # 每块端口数
     SCAN_CHUNK_MAX_RETRIES: int = int(os.getenv("SCAN_CHUNK_MAX_RETRIES", "2"))  # 失败端口块最大重试次数
@@ -74,3 +83,49 @@ settings = Settings()
 if not settings.JWT_SECRET_KEY:
     logger.critical("JWT_SECRET_KEY is not set! Refusing to start with empty secret.")
     sys.exit(1)
+
+
+def ensure_encrypt_key() -> str:
+    """确保 ENCRYPT_KEY 存在，不存在则自动生成并写入 .env
+
+    Returns:
+        ENCRYPT_KEY 字符串
+    """
+    if settings.ENCRYPT_KEY:
+        return settings.ENCRYPT_KEY
+
+    # 自动生成
+    from app.utils.crypto import generate_encryption_key
+    new_key = generate_encryption_key()
+    settings.ENCRYPT_KEY = new_key
+
+    # 写入 .env
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    try:
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                lines = f.readlines()
+
+        # 检查是否已有 ENCRYPT_KEY 行
+        found = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith("ENCRYPT_KEY="):
+                lines[i] = f"ENCRYPT_KEY={new_key}\n"
+                found = True
+                break
+
+        if not found:
+            # 在文件末尾追加
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(f"ENCRYPT_KEY={new_key}\n")
+
+        with open(env_path, "w") as f:
+            f.writelines(lines)
+
+        logger.info("ENCRYPT_KEY 已自动生成并写入 .env")
+    except Exception as e:
+        logger.warning(f"无法写入 ENCRYPT_KEY 到 .env: {e}，请手动设置")
+
+    return new_key
