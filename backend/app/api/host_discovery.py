@@ -39,31 +39,31 @@ async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
         task_handle = asyncio.create_task(execute_scan(task.id))
         task_handle.add_done_callback(lambda t: logger.error(f"Scan task {task.id} failed: {t.exception()}") if t.exception() else None)
 
-    if req.scan_type == ScanType.periodic and req.interval_minutes:
+    if req.scan_type == ScanType.periodic and req.interval_hours:
         try:
             from app.services.scheduler import scheduler_service
-            scheduler_service.add_periodic_scan(task.id, req.interval_minutes)
+            scheduler_service.add_periodic_scan(task.id, req.interval_hours)
         except Exception as e:
             logger.error(f"Failed to register periodic scan: {e}")
 
 
-@router.post("/", response_model=ScanTaskResponse)
+@router.post("", response_model=ScanTaskResponse)
 async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Create a host discovery scan task."""
     # Force host discovery category and validate methods
     req.scan_category = ScanCategory.host_discovery
-    if req.scan_type == ScanType.periodic and (not req.interval_minutes or req.interval_minutes < 1):
-        raise HTTPException(status_code=422, detail="周期扫描必须设置间隔时间（分钟）")
+    if req.scan_type == ScanType.periodic and (not req.interval_hours or req.interval_hours < 1):
+        raise HTTPException(status_code=422, detail="周期扫描必须设置间隔时间（小时）")
 
     next_run = None
-    if req.scan_type == ScanType.periodic and req.interval_minutes:
-        next_run = datetime.now(timezone.utc) + timedelta(minutes=req.interval_minutes)
+    if req.scan_type == ScanType.periodic and req.interval_hours:
+        next_run = datetime.now(timezone.utc) + timedelta(hours=req.interval_hours)
 
     task = ScanTask(
         name=req.name, targets=req.targets, scan_category=ScanCategory.host_discovery,
         scan_type=req.scan_type, scan_mode=req.scan_mode,
         scan_methods=[],  # 主机发现固定两阶段(Ping+Top1000)，scan_methods 不参与调度
-        ports=req.ports, max_concurrent=req.max_concurrent, interval_minutes=req.interval_minutes,
+        ports=req.ports, max_concurrent=req.max_concurrent, interval_hours=req.interval_hours,
         created_by=current_user.id, next_run=next_run,
         is_active=True
     )
@@ -76,7 +76,7 @@ async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db),
     return task
 
 
-@router.get("/")
+@router.get("")
 async def list_host_scans(
     scan_type: ScanType | None = None,
     skip: int = 0, limit: int = 50,
@@ -126,14 +126,14 @@ async def update_host_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSessio
         task.ports = req.ports
     if req.max_concurrent is not None:
         task.max_concurrent = req.max_concurrent
-    if req.interval_minutes is not None:
-        task.interval_minutes = req.interval_minutes
+    if req.interval_hours is not None:
+        task.interval_hours = req.interval_hours
         if task.scan_type == ScanType.periodic and task.is_active:
-            task.next_run = datetime.now(timezone.utc) + timedelta(minutes=req.interval_minutes)
+            task.next_run = datetime.now(timezone.utc) + timedelta(hours=req.interval_hours)
             try:
                 from app.services.scheduler import scheduler_service
                 scheduler_service.remove_periodic_scan(task.id)
-                scheduler_service.add_periodic_scan(task.id, req.interval_minutes)
+                scheduler_service.add_periodic_scan(task.id, req.interval_hours)
             except Exception as e:
                 logger.error(f"Failed to update scheduler for scan {task.id}: {e}")
 
@@ -175,11 +175,11 @@ async def activate_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), c
     if task.scan_type != ScanType.periodic:
         raise HTTPException(status_code=400, detail="仅周期扫描可启用/停用")
     task.is_active = True
-    task.next_run = datetime.now(timezone.utc) + timedelta(minutes=task.interval_minutes)
+    task.next_run = datetime.now(timezone.utc) + timedelta(hours=task.interval_hours)
     await db.commit()
     try:
         from app.services.scheduler import scheduler_service
-        scheduler_service.add_periodic_scan(task.id, task.interval_minutes)
+        scheduler_service.add_periodic_scan(task.id, task.interval_hours)
     except Exception as e:
         logger.error(f"Failed to activate periodic scan {task.id}: {e}")
     return {"message": "周期扫描已启用"}
@@ -295,10 +295,10 @@ async def rescan_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), cur
         task_handle = asyncio.create_task(execute_scan(task.id))
         task_handle.add_done_callback(lambda t: logger.error(f"Rescan task {task.id} failed: {t.exception()}") if t.exception() else None)
 
-    if task.scan_type == ScanType.periodic and task.is_active and task.interval_minutes:
+    if task.scan_type == ScanType.periodic and task.is_active and task.interval_hours:
         try:
             from app.services.scheduler import scheduler_service
-            scheduler_service.add_periodic_scan(task.id, task.interval_minutes)
+            scheduler_service.add_periodic_scan(task.id, task.interval_hours)
         except Exception as e:
             logger.error(f"Failed to register periodic rescan: {e}")
 

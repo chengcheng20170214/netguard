@@ -42,7 +42,7 @@ class ScanRequest(BaseModel):
         if v < 1 or v > 16:
             raise ValueError("并发数必须在 1-16 之间")
         return v
-    interval_minutes: int | None = None
+    interval_hours: int = 72
 
     @model_validator(mode="after")
     def validate_profile_or_methods(self) -> "ScanRequest":
@@ -80,7 +80,7 @@ class ScanUpdateRequest(BaseModel):
     scan_profile_id: int | None = None   # 新增：更新扫描策略
     ports: str | None = None
     max_concurrent: int | None = None
-    interval_minutes: int | None = None
+    interval_hours: int | None = None
 
     @field_validator("max_concurrent")
     @classmethod
@@ -108,11 +108,11 @@ class ScanUpdateRequest(BaseModel):
             raise ValueError("; ".join(errors))
         return "\n".join(validated)
 
-    @field_validator("interval_minutes")
+    @field_validator("interval_hours")
     @classmethod
     def validate_interval(cls, v: int | None) -> int | None:
         if v is not None and v < 1:
-            raise ValueError("周期扫描间隔必须大于0分钟")
+            raise ValueError("周期扫描间隔必须大于0小时")
         return v
 
 
@@ -127,7 +127,7 @@ class ScanTaskResponse(BaseModel):
     scan_profile_id: int | None = None   # 新增：关联扫描策略
     ports: str | None = None
     max_concurrent: int = 4
-    interval_minutes: int | None = None
+    interval_hours: int | None = None
     is_active: bool = True
     status: ScanStatus = ScanStatus.pending
     progress: int = 0

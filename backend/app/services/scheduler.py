@@ -35,7 +35,7 @@ class SchedulerService:
             )
             tasks = result.scalars().all()
             for task in tasks:
-                self.add_periodic_scan(task.id, task.interval_minutes)
+                self.add_periodic_scan(task.id, task.interval_hours)
 
         logger.info(f"Scheduler started with {len(self._periodic_tasks)} periodic scans")
 
@@ -47,13 +47,13 @@ class SchedulerService:
         self._periodic_tasks.clear()
         logger.info("Scheduler stopped")
 
-    def add_periodic_scan(self, scan_task_id: int, interval_minutes: int):
+    def add_periodic_scan(self, scan_task_id: int, interval_hours: int):
         """注册周期扫描任务"""
         if scan_task_id in self._periodic_tasks:
             self._periodic_tasks[scan_task_id].cancel()
-        atask = asyncio.create_task(self._run_periodic(scan_task_id, interval_minutes))
+        atask = asyncio.create_task(self._run_periodic(scan_task_id, interval_hours))
         self._periodic_tasks[scan_task_id] = atask
-        logger.info(f"Registered periodic scan: task={scan_task_id}, interval={interval_minutes}min")
+        logger.info(f"Registered periodic scan: task={scan_task_id}, interval={interval_hours}h")
 
     def remove_periodic_scan(self, scan_task_id: int):
         """移除周期扫描任务"""
@@ -62,7 +62,7 @@ class SchedulerService:
             del self._periodic_tasks[scan_task_id]
             logger.info(f"Removed periodic scan: task={scan_task_id}")
 
-    async def _run_periodic(self, scan_task_id: int, interval_minutes: int):
+    async def _run_periodic(self, scan_task_id: int, interval_hours: int):
         """周期扫描循环: 等待间隔 → 检查 → 执行 → 下一轮
 
         关键: await execute_scan() 会阻塞等待全部阶段完成才返回，
@@ -75,7 +75,7 @@ class SchedulerService:
 
         while self._running:
             # 等待间隔
-            await asyncio.sleep(interval_minutes * 60)
+            await asyncio.sleep(interval_hours * 3600)
 
             if not self._running:
                 break
@@ -97,7 +97,7 @@ class SchedulerService:
                         continue
 
                     # 记录预计下次执行时间
-                    task.next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+                    task.next_run = datetime.now(timezone.utc) + timedelta(hours=interval_hours)
                     await db.commit()
 
             except Exception as e:
@@ -125,7 +125,7 @@ class SchedulerService:
                     task = result.scalar_one_or_none()
                     if task:
                         task.last_run = datetime.now(timezone.utc)
-                        task.next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+                        task.next_run = datetime.now(timezone.utc) + timedelta(hours=interval_hours)
 
                         if scan_error and task.status == ScanStatus.running:
                             task.status = ScanStatus.failed

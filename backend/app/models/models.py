@@ -73,7 +73,7 @@ class ScanTask(Base):
     scan_methods = Column(JSON, default=list)
     ports = Column(String(200), default=None)
     max_concurrent = Column(Integer, default=4)
-    interval_minutes = Column(Integer, default=None)
+    interval_hours = Column(Integer, default=72)
     is_active = Column(Boolean, default=True)
     status = Column(Enum(ScanStatus), default=ScanStatus.pending, nullable=False)
     progress = Column(Integer, default=0)

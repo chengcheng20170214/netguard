@@ -84,9 +84,9 @@
             <el-radio-button value="periodic">周期扫描</el-radio-button>
           </el-radio-group>
         </el-form-item>
-        <el-form-item v-if="scanForm.scan_type === 'periodic'" label="扫描间隔" prop="interval_minutes">
-          <el-input-number v-model="scanForm.interval_minutes" :min="1" :max="10080" />
-          <span style="margin-left:8px;color:#909399">分钟</span>
+        <el-form-item v-if="scanForm.scan_type === 'periodic'" label="扫描间隔" prop="interval_hours">
+          <el-input-number v-model="scanForm.interval_hours" :min="1" :max="8760" />
+          <span style="margin-left:8px;color:#909399">小时</span>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="submitting" @click="handleSubmit">开始扫描</el-button>
@@ -140,8 +140,8 @@
             <el-table-column label="策略" width="130">
               <template #default="{ row }">{{ profileNameForTask(row) }}</template>
             </el-table-column>
-            <el-table-column prop="interval_minutes" label="间隔" width="80">
-              <template #default="{ row }">{{ row.interval_minutes }}分钟</template>
+            <el-table-column prop="interval_hours" label="间隔" width="80">
+              <template #default="{ row }">{{ row.interval_hours }}小时</template>
             </el-table-column>
             <el-table-column label="状态" width="100">
               <template #default="{ row }"><el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag></template>
@@ -194,8 +194,8 @@
           </div>
         </el-form-item>
         <el-form-item v-if="editForm.scan_type === 'periodic'" label="扫描间隔">
-          <el-input-number v-model="editForm.interval_minutes" :min="1" :max="10080" />
-          <span style="margin-left:8px;color:#909399">分钟</span>
+          <el-input-number v-model="editForm.interval_hours" :min="1" :max="8760" />
+          <span style="margin-left:8px;color:#909399">小时</span>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -334,7 +334,7 @@ const onResultExpand = ({ id }, expandedRows) => {
 // Edit dialog state
 const editVisible = ref(false)
 const editSubmitting = ref(false)
-const editForm = reactive({ id: null, name: '', targets: '', scan_type: '', scan_profile_id: null, interval_minutes: 60 })
+const editForm = reactive({ id: null, name: '', targets: '', scan_type: '', scan_profile_id: null, interval_hours: 72 })
 
 // Auto-refresh timer
 let refreshTimer = null
@@ -424,7 +424,7 @@ const periodicScans = computed(() => scans.value.filter(s => s.scan_type === 'pe
 
 // ──── Form ────
 
-const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', interval_minutes: 60, scan_profile_id: null })
+const scanForm = reactive({ name: '', targets: '', scan_type: 'one_time', interval_hours: 72, scan_profile_id: null })
 const scanRules = {
   name: [{ required: true, message: '请输入任务名称', trigger: 'blur' }],
   targets: [{ required: true, message: '请选择扫描目标', trigger: 'change' }],
@@ -490,7 +490,7 @@ const handleSubmit = async () => {
       name: scanForm.name,
       targets: scanForm.targets,
       scan_type: scanForm.scan_type,
-      interval_minutes: scanForm.scan_type === 'periodic' ? scanForm.interval_minutes : null,
+      interval_hours: scanForm.scan_type === 'periodic' ? scanForm.interval_hours : null,
       scan_category: 'service_discovery',
       scan_profile_id: scanForm.scan_profile_id,
       // Legacy fields — not used by new engine but required by schema
@@ -587,7 +587,7 @@ const handleEdit = (row) => {
   editForm.targets = row.targets
   editForm.scan_type = row.scan_type
   editForm.scan_profile_id = row.scan_profile_id || null
-  editForm.interval_minutes = row.interval_minutes || 60
+  editForm.interval_hours = row.interval_hours || 72
   editVisible.value = true
 }
 
@@ -606,7 +606,7 @@ const submitEdit = async () => {
       name: editForm.name,
       targets: editForm.targets,
       scan_profile_id: editForm.scan_profile_id || null,
-      interval_minutes: editForm.scan_type === 'periodic' ? editForm.interval_minutes : null
+      interval_hours: editForm.scan_type === 'periodic' ? editForm.interval_hours : null
     })
     ElMessage.success('任务已更新')
     editVisible.value = false
