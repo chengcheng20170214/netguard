@@ -27,12 +27,13 @@ def _validate_single_target(t: str) -> str:
 
 class ScanRequest(BaseModel):
     name: str
-    targets: str
+    targets: str = ""  # target_all_assets=True 时可为空
     scan_category: ScanCategory = ScanCategory.host_discovery
     scan_type: ScanType = ScanType.one_time
     scan_mode: ScanMode = ScanMode.standard
     scan_methods: list[ScanMethod] = []  # 服务发现时填写，主机发现时忽略（固定两阶段）
     scan_profile_id: int | None = None   # 新增：扫描策略ID，优先于 scan_methods
+    target_all_assets: bool = False       # 周期扫描时动态获取所有资产
     ports: str | None = None
     max_concurrent: int = 4
 
@@ -53,14 +54,18 @@ class ScanRequest(BaseModel):
         elif (self.scan_category == ScanCategory.service_discovery
               and not self.scan_methods):
             raise ValueError("服务发现任务必须指定扫描策略(scan_profile_id)或扫描方法(scan_methods)")
+        # target_all_assets=True 时 targets 可以为空，运行时动态填充
+        if not self.target_all_assets and not self.targets.strip():
+            raise ValueError('请至少输入一个扫描目标，或开启"扫描所有资产"')
         return self
 
     @field_validator("targets")
     @classmethod
     def validate_targets(cls, v: str) -> str:
+        # targets 为空且 target_all_assets=True 时跳过验证（由 model_validator 处理）
+        if not v.strip():
+            return v
         lines = [line.strip() for line in v.strip().splitlines() if line.strip()]
-        if not lines:
-            raise ValueError("请至少输入一个扫描目标")
         validated = []
         errors = []
         for i, line in enumerate(lines, 1):
@@ -125,6 +130,7 @@ class ScanTaskResponse(BaseModel):
     scan_mode: ScanMode
     scan_methods: list | None = None
     scan_profile_id: int | None = None   # 新增：关联扫描策略
+    target_all_assets: bool = False       # 周期扫描时动态获取所有资产
     ports: str | None = None
     max_concurrent: int = 4
     interval_hours: int | None = None
@@ -138,7 +144,7 @@ class ScanTaskResponse(BaseModel):
     created_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
-    current_phase: str = ""              # 新增：当前阶段(port_scan/service_and_script/os_detect)
+    current_phase: str | None = ""       # 新增：当前阶段(port_scan/service_and_script/os_detect)
     last_duration_sec: int | None = None # 新增：上次耗时
 
     model_config = {"from_attributes": True}

@@ -18,6 +18,7 @@ SERVICE_METHODS = {ScanMethod.nmap_syn, ScanMethod.nmap_syn_full, ScanMethod.nma
 
 
 async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
+    """仅负责调度一次性扫描执行，不处理周期扫描的scheduler注册"""
     import asyncio
     dispatched = False
     try:
@@ -41,13 +42,6 @@ async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
         task_handle = asyncio.create_task(execute_scan(task.id))
         task_handle.add_done_callback(lambda t: logger.error(f"Scan task {task.id} failed: {t.exception()}") if t.exception() else None)
 
-    if req.scan_type == ScanType.periodic and req.interval_hours:
-        try:
-            from app.services.scheduler import scheduler_service
-            scheduler_service.add_periodic_scan(task.id, req.interval_hours)
-        except Exception as e:
-            logger.error(f"Failed to register periodic scan: {e}")
-
 
 @router.post("", response_model=ScanTaskResponse)
 async def create_service_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -62,13 +56,14 @@ async def create_service_scan(req: ScanRequest, db: AsyncSession = Depends(get_d
 
     next_run = None
     if req.scan_type == ScanType.periodic and req.interval_hours:
-        next_run = datetime.now(timezone.utc) + timedelta(hours=req.interval_hours)
+        next_run = datetime.now(timezone.utc)  # scheduler 会立即执行首次扫描
 
     task = ScanTask(
         name=req.name, targets=req.targets, scan_category=ScanCategory.service_discovery,
         scan_type=req.scan_type, scan_mode=req.scan_mode,
         scan_methods=[m.value for m in req.scan_methods],
         scan_profile_id=req.scan_profile_id,  # 新引擎: 绑定扫描策略
+        target_all_assets=req.target_all_assets,  # 周期扫描动态获取所有资产
         ports=req.ports, max_concurrent=req.max_concurrent, interval_hours=req.interval_hours,
         created_by=current_user.id, next_run=next_run,
         is_active=True
@@ -77,7 +72,16 @@ async def create_service_scan(req: ScanRequest, db: AsyncSession = Depends(get_d
     await db.commit()
     await db.refresh(task)
 
-    await _dispatch_scan(task, req, db)
+    if req.scan_type == ScanType.periodic:
+        # 周期扫描：注册到 scheduler，由 scheduler 立即执行首次扫描
+        try:
+            from app.services.scheduler import scheduler_service
+            scheduler_service.add_periodic_scan(task.id, req.interval_hours)
+        except Exception as e:
+            logger.error(f"Failed to register periodic scan: {e}")
+    else:
+        # 一次性扫描：直接调度执行
+        await _dispatch_scan(task, req, db)
 
     return task
 
@@ -138,7 +142,7 @@ async def update_service_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSes
     if req.interval_hours is not None:
         task.interval_hours = req.interval_hours
         if task.scan_type == ScanType.periodic and task.is_active:
-            task.next_run = datetime.now(timezone.utc) + timedelta(hours=req.interval_hours)
+            task.next_run = datetime.now(timezone.utc)  # scheduler 重新注册后会立即执行
             try:
                 from app.services.scheduler import scheduler_service
                 scheduler_service.remove_periodic_scan(task.id)
@@ -169,7 +173,13 @@ async def cancel_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), 
             scheduler_service.remove_periodic_scan(task.id)
         except Exception as e:
             logger.warning(f"Failed to remove periodic scan {task.id} from scheduler: {e}")
+    # 通知 scan_executor 取消
+    from app.services.scan_executor import request_cancel
+    request_cancel(scan_id)
     task.status = ScanStatus.cancelled
+    task.completed_at = datetime.now(timezone.utc)
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(task, "scan_log")
     await db.commit()
     return {"message": "扫描任务已取消"}
 
@@ -184,7 +194,7 @@ async def activate_service_scan(scan_id: int, db: AsyncSession = Depends(get_db)
     if task.scan_type != ScanType.periodic:
         raise HTTPException(status_code=400, detail="仅周期扫描可启用/停用")
     task.is_active = True
-    task.next_run = datetime.now(timezone.utc) + timedelta(hours=task.interval_hours)
+    task.next_run = datetime.now(timezone.utc)  # scheduler 会立即执行
     await db.commit()
     try:
         from app.services.scheduler import scheduler_service
@@ -293,69 +303,37 @@ async def rescan_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), 
     await db.commit()
     await db.refresh(task)
 
-    # Dispatch scan directly without reconstructing ScanRequest
-    # (avoids ScanMethod enum validation errors for legacy data)
-    import asyncio
-    dispatched = False
-    try:
-        from app.tasks.scan_tasks import run_scan_task
-        scan_mode_val = task.scan_mode.value if hasattr(task.scan_mode, 'value') else str(task.scan_mode)
-        await asyncio.wait_for(
-            asyncio.to_thread(
-                run_scan_task.delay,
-                task.id, task.targets, scan_mode_val, task.ports
-            ),
-            timeout=3.0
-        )
-        dispatched = True
-    except Exception as e:
-        logger.error(f"Failed to dispatch rescan via Celery: {e}")
-
-    if not dispatched:
-        from app.services.scan_executor import execute_scan
-        task_handle = asyncio.create_task(execute_scan(task.id))
-        task_handle.add_done_callback(lambda t: logger.error(f"Rescan task {task.id} failed: {t.exception()}") if t.exception() else None)
-
     if task.scan_type == ScanType.periodic and task.is_active and task.interval_hours:
+        # 周期扫描：仅重新注册 scheduler，由 scheduler 立即执行首次扫描
         try:
             from app.services.scheduler import scheduler_service
             scheduler_service.add_periodic_scan(task.id, task.interval_hours)
         except Exception as e:
             logger.error(f"Failed to register periodic rescan: {e}")
-
-    await db.refresh(task)
-    return task
-
-
-@router.post("/{scan_id}/cancel", response_model=ScanTaskResponse)
-async def cancel_service_scan(scan_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Cancel a running scan task."""
-    result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
-    task = result.scalar_one_or_none()
-    if not task:
-        raise HTTPException(status_code=404, detail="扫描任务不存在")
-    if task.status != ScanStatus.running:
-        raise HTTPException(status_code=400, detail="只有运行中的任务才能取消")
-
-    # 通知新引擎取消
-    from app.services.scan_executor import request_cancel
-    request_cancel(task.id)
-
-    task.status = ScanStatus.cancelled
-    task.completed_at = datetime.now(timezone.utc)
-    from sqlalchemy.orm.attributes import flag_modified
-    flag_modified(task, "scan_log")
-    await db.commit()
-    await db.refresh(task)
-
-    # 停止周期调度
-    if task.scan_type == ScanType.periodic and task.is_active:
+    else:
+        # 一次性扫描：直接调度执行
+        import asyncio
+        dispatched = False
         try:
-            from app.services.scheduler import scheduler_service
-            scheduler_service.remove_periodic_scan(task.id)
+            from app.tasks.scan_tasks import run_scan_task
+            scan_mode_val = task.scan_mode.value if hasattr(task.scan_mode, 'value') else str(task.scan_mode)
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_scan_task.delay,
+                    task.id, task.targets, scan_mode_val, task.ports
+                ),
+                timeout=3.0
+            )
+            dispatched = True
         except Exception as e:
-            logger.error(f"Failed to remove periodic scan {task.id} after cancel: {e}")
+            logger.error(f"Failed to dispatch rescan via Celery: {e}")
 
+        if not dispatched:
+            from app.services.scan_executor import execute_scan
+            task_handle = asyncio.create_task(execute_scan(task.id))
+            task_handle.add_done_callback(lambda t: logger.error(f"Rescan task {task.id} failed: {t.exception()}") if t.exception() else None)
+
+    await db.refresh(task)
     return task
 
 

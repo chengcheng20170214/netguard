@@ -29,7 +29,7 @@ from app.models.models import (
     ScanChunk, ScanChunkStatus, ScanProfile, ScanCheckpoint,
 )
 from app.services.scanner import SCANNER_REGISTRY
-from app.services.scanner.nmap_scanner import NmapScanner
+from app.services.scanner.nmap_scanner import NmapScanner, _build_tcp_scan_args, _build_ping_args
 from app.services.change_tracker import create_snapshot, compare_snapshots
 from app.config import settings
 
@@ -604,8 +604,7 @@ async def _phase1_top1000(
                             if ip_ports:
                                 open_ports_map[r_ip] = ip_ports
                             # 直写DB
-                            async with async_session() as db:
-                                await persist_host_incremental(db, scan_task_id, r_ip, r)
+                            await persist_host_incremental(scan_task_id=scan_task_id, ip=r_ip, result=r)
 
                     completed_ips.add(ip)  # 无论有无开放端口都标记完成
 
@@ -657,7 +656,7 @@ async def _phase1_top1000(
                         if ip_ports:
                             open_ports_map[r_ip] = ip_ports
                         async with async_session() as db:
-                            await persist_host_incremental(db, scan_task_id, r_ip, r)
+                            await persist_host_incremental(scan_task_id=scan_task_id, ip=r_ip, result=r)
 
                 for ip in ip_group:
                     completed_ips.add(ip)
@@ -763,7 +762,7 @@ async def _phase1_full_scan(
                 for r in scan_results:
                     r_ip = r.get("ip")
                     if r_ip:
-                        await persist_host_incremental(db, scan_task_id, r_ip, r)
+                        await persist_host_incremental(scan_task_id=scan_task_id, ip=r_ip, result=r)
                         # 汇总开放端口
                         if r.get("ports"):
                             # nmap_scanner 只返回开放端口，无需再过滤 state
@@ -846,8 +845,7 @@ async def _phase1_custom(
                             ip_ports = [p["port"] for p in r["ports"]]
                             if ip_ports:
                                 open_ports_map[r_ip] = ip_ports
-                            async with async_session() as db:
-                                await persist_host_incremental(db, scan_task_id, r_ip, r)
+                            await persist_host_incremental(scan_task_id=scan_task_id, ip=r_ip, result=r)
                     completed_ips.add(ip)
                 except asyncio.CancelledError:
                     raise
@@ -883,8 +881,7 @@ async def _phase1_custom(
                         ip_ports = [p["port"] for p in r["ports"]]
                         if ip_ports:
                             open_ports_map[r_ip] = ip_ports
-                        async with async_session() as db:
-                            await persist_host_incremental(db, scan_task_id, r_ip, r)
+                        await persist_host_incremental(scan_task_id=scan_task_id, ip=r_ip, result=r)
                 for ip in ip_group:
                     completed_ips.add(ip)
             except asyncio.CancelledError:
@@ -1015,18 +1012,18 @@ async def _phase23_service_and_script_with_checkpoint(
         args.extend(["--max-scan-delay", f"{timing.get('max_scan_delay_ms', 10)}ms"])
 
         try:
+            # 阶段2+3使用-sT(TCP Connect)，不需要sudo提权
             results = await _run_nmap_with_timeout(
                 ip, args, timeout_sec=nmap_timeout,
                 scan_task_id=scan_task_id,
-                use_sudo=use_sudo,
-                sudo_password=sudo_password,
+                use_sudo=False,
+                sudo_password=None,
             )
 
             for r in results:
                 r_ip = r.get("ip")
                 if r_ip:
-                    async with async_session() as db:
-                        await persist_host_incremental(db, scan_task_id, r_ip, r)
+                    await persist_host_incremental(scan_task_id=scan_task_id, ip=r_ip, result=r)
 
             completed_ips.add(ip)
 
@@ -1168,8 +1165,7 @@ async def _phase4_os_detect_with_checkpoint(
             for r in results:
                 r_ip = r.get("ip")
                 if r_ip:
-                    async with async_session() as db:
-                        await persist_host_incremental(db, scan_task_id, r_ip, r)
+                    await persist_host_incremental(scan_task_id=scan_task_id, ip=r_ip, result=r)
 
             completed_ips.add(ip)
 
@@ -1242,6 +1238,11 @@ async def run_service_discovery(
 
             # 加载所有断点
             checkpoints = await _load_all_checkpoints(db, scan_task_id)
+
+            # 防止重复执行：如果任务已在运行中，跳过
+            if scan_task.status == ScanStatus.running:
+                logger.warning(f"任务 {scan_task_id} 已在运行中，跳过重复执行")
+                return
 
             # 设置任务状态为 running
             scan_task.status = ScanStatus.running
@@ -1407,26 +1408,43 @@ async def _complete_scan_task(db: AsyncSession, scan_task: ScanTask):
 # 主入口 execute_scan — 新旧引擎分流
 # ========================================================================
 
+# 全局执行锁：防止同一 scan_task_id 被并行执行
+_executing_tasks: set[int] = set()
+_exec_lock = asyncio.Lock()
+
+
 async def execute_scan(scan_task_id: int):
     """扫描执行主入口 — 根据 scan_profile_id 分流到旧/新引擎
 
     - 有 scan_profile_id → 新引擎 (run_service_discovery)
     - 无 scan_profile_id → 旧引擎 (_execute_scan_legacy)
+    - 全局执行锁防止同一 task_id 并行执行
     """
-    async with async_session() as db:
-        scan_task = await db.get(ScanTask, scan_task_id)
-        if not scan_task:
-            logger.error(f"任务 {scan_task_id} 不存在")
+    # 全局执行锁：防止同一任务被并行启动（如 scheduler 重载、rescan 重复调用等）
+    async with _exec_lock:
+        if scan_task_id in _executing_tasks:
+            logger.warning(f"任务 {scan_task_id} 已在执行中，跳过重复调用")
             return
+        _executing_tasks.add(scan_task_id)
 
-        has_profile = scan_task.scan_profile_id is not None
+    try:
+        async with async_session() as db:
+            scan_task = await db.get(ScanTask, scan_task_id)
+            if not scan_task:
+                logger.error(f"任务 {scan_task_id} 不存在")
+                return
 
-    if has_profile:
-        logger.info(f"任务 {scan_task_id}: 使用新引擎 (profile={scan_task.scan_profile_id})")
-        await run_service_discovery(scan_task_id)
-    else:
-        logger.info(f"任务 {scan_task_id}: 使用旧引擎 (scan_methods)")
-        await _execute_scan_legacy(scan_task_id)
+            has_profile = scan_task.scan_profile_id is not None
+
+        if has_profile:
+            logger.info(f"任务 {scan_task_id}: 使用新引擎 (profile={scan_task.scan_profile_id})")
+            await run_service_discovery(scan_task_id)
+        else:
+            logger.info(f"任务 {scan_task_id}: 使用旧引擎 (scan_methods)")
+            await _execute_scan_legacy(scan_task_id)
+    finally:
+        async with _exec_lock:
+            _executing_tasks.discard(scan_task_id)
 
 
 # ========================================================================
@@ -1434,11 +1452,11 @@ async def execute_scan(scan_task_id: int):
 # ========================================================================
 
 async def _execute_scan_legacy(scan_task_id: int):
-    """旧引擎: 兼容 scan_methods 模式的扫描执行（无断点恢复）
+    """旧引擎: 兼容主机发现和旧式服务发现（无断点恢复）
 
     保留此函数用于:
-    - host_discovery.py 主机发现
-    - 旧式服务发现（无 ScanProfile）
+    - 主机发现 (scan_category=host_discovery): 两阶段 Ping + Top1000
+    - 旧式服务发现 (scan_methods 列表): 无 ScanProfile 的服务扫描
     """
     async with async_session() as db:
         scan_task = await db.get(ScanTask, scan_task_id)
@@ -1450,6 +1468,10 @@ async def _execute_scan_legacy(scan_task_id: int):
             logger.info(f"任务 {scan_task_id} 已完成，跳过")
             return
 
+        if scan_task.status == ScanStatus.running:
+            logger.warning(f"任务 {scan_task_id} 已在运行中，跳过重复执行")
+            return
+
         scan_task.status = ScanStatus.running
         scan_task.started_at = scan_task.started_at or datetime.now(timezone.utc)
         await db.commit()
@@ -1457,53 +1479,63 @@ async def _execute_scan_legacy(scan_task_id: int):
         targets = scan_task.targets
         scan_methods = scan_task.scan_methods or []
         scan_mode = scan_task.scan_mode or "standard"
+        scan_category = scan_task.scan_category
+        max_concurrent = scan_task.max_concurrent or 4
 
         all_results: dict[str, dict] = {}
         await _append_log(db, scan_task, f"开始扫描: {targets}, 方式: {scan_methods}, 模式: {scan_mode}")
 
     try:
-        for method in scan_methods:
-            async with async_session() as db:
-                scan_task = await db.get(ScanTask, scan_task_id)
-                if not scan_task or scan_task.status != ScanStatus.running:
-                    break
-
-            scanner_cls = SCANNER_REGISTRY.get(method)
-            if not scanner_cls:
-                logger.warning(f"Unknown scan method: {method}")
-                continue
-
-            scanner = scanner_cls()
-
-            # 全端口扫描走分块逻辑
-            if method == "nmap_syn_full":
+        # ---- 主机发现: 固定两阶段 Ping + Top1000 ----
+        cat_val = scan_category.value if hasattr(scan_category, "value") else str(scan_category)
+        if cat_val == "host_discovery":
+            await _run_host_discovery_legacy(
+                scan_task_id, targets, scan_mode, max_concurrent, all_results
+            )
+        else:
+            # ---- 服务发现: 按 scan_methods 遍历 ----
+            for method in scan_methods:
                 async with async_session() as db:
                     scan_task = await db.get(ScanTask, scan_task_id)
-                    if scan_task:
-                        await _ensure_chunks(db, scan_task_id, scan_task)
-                        await _retry_failed_chunks(db, scan_task_id, scan_task)
-                        await _run_chunked_full_scan(db, scan_task, scanner, all_results, scan_mode)
-                continue
+                    if not scan_task or scan_task.status != ScanStatus.running:
+                        break
 
-            # 普通扫描
-            try:
-                results = await scanner.scan(
-                    targets, scan_method=method, scan_mode=scan_mode
-                )
-                _merge_results(all_results, results)
+                scanner_cls = SCANNER_REGISTRY.get(method)
+                if not scanner_cls:
+                    logger.warning(f"Unknown scan method: {method}")
+                    continue
 
-                async with async_session() as db:
-                    scan_task = await db.get(ScanTask, scan_task_id)
-                    if scan_task:
-                        await _append_log(db, scan_task, f"扫描方式 {method} 完成: 发现 {len(results)} 个主机")
-                        await _update_progress(db, scan_task, 0, all_results)
+                scanner = scanner_cls()
 
-            except Exception as e:
-                logger.error(f"扫描方式 {method} 失败: {e}")
-                async with async_session() as db:
-                    scan_task = await db.get(ScanTask, scan_task_id)
-                    if scan_task:
-                        await _append_log(db, scan_task, f"扫描方式 {method} 失败: {e}")
+                # 全端口扫描走分块逻辑
+                if method == "nmap_syn_full":
+                    async with async_session() as db:
+                        scan_task = await db.get(ScanTask, scan_task_id)
+                        if scan_task:
+                            await _ensure_chunks(db, scan_task_id, scan_task)
+                            await _retry_failed_chunks(db, scan_task_id, scan_task)
+                            await _run_chunked_full_scan(db, scan_task, scanner, all_results, scan_mode)
+                    continue
+
+                # 普通扫描
+                try:
+                    results = await scanner.scan(
+                        targets, scan_method=method, scan_mode=scan_mode
+                    )
+                    _merge_results(all_results, results)
+
+                    async with async_session() as db:
+                        scan_task = await db.get(ScanTask, scan_task_id)
+                        if scan_task:
+                            await _append_log(db, scan_task, f"扫描方式 {method} 完成: 发现 {len(results)} 个主机")
+                            await _update_progress(db, scan_task, 0, all_results)
+
+                except Exception as e:
+                    logger.error(f"扫描方式 {method} 失败: {e}")
+                    async with async_session() as db:
+                        scan_task = await db.get(ScanTask, scan_task_id)
+                        if scan_task:
+                            await _append_log(db, scan_task, f"扫描方式 {method} 失败: {e}")
 
         # 保存结果
         async with async_session() as db:
@@ -1674,10 +1706,14 @@ def _merge_results(all_results: dict, new_results: list):
                     existing[key] = result[key]
 
 
-async def persist_results(db: AsyncSession, scan_task: ScanTask, all_results: dict):
-    """旧引擎: 批量持久化扫描结果到数据库"""
+async def persist_results(db: AsyncSession | None, scan_task: ScanTask, all_results: dict):
+    """旧引擎: 批量持久化扫描结果到数据库
+
+    db 参数已不再使用（persist_host_incremental 内部使用独立 session），
+    保留参数仅为兼容已有调用方签名。
+    """
     for ip, data in all_results.items():
-        await persist_host_incremental(db, scan_task.id, ip, data)
+        await persist_host_incremental(scan_task_id=scan_task.id, ip=ip, result=data)
 
 
 # ========================================================================
@@ -1685,10 +1721,10 @@ async def persist_results(db: AsyncSession, scan_task: ScanTask, all_results: di
 # ========================================================================
 
 async def persist_host_incremental(
-    db: AsyncSession,
-    scan_task_id: int,
-    ip: str,
-    result: dict,
+    db: AsyncSession | None = None,
+    scan_task_id: int = 0,
+    ip: str = "",
+    result: dict | None = None,
 ):
     """增量持久化单主机扫描结果到数据库
 
@@ -1698,7 +1734,14 @@ async def persist_host_incremental(
     - 记录资产变更到 AssetChange 表
 
     此函数被新引擎和旧引擎共用。
+
+    始终使用独立的数据库 session，避免与调用方的 session 产生并发冲突
+    (SQLAlchemy 的 AsyncSession 不支持同一 session 上的并发操作)。
+    传入的 db 参数会被忽略，仅保留以兼容旧调用方签名。
     """
+    if result is None:
+        return
+
     ports_data = result.get("ports", [])
     hostname = result.get("hostname")
     mac = result.get("mac")
@@ -1708,8 +1751,9 @@ async def persist_host_incremental(
     # 生成指纹
     fingerprint = generate_fingerprint(mac, hostname, os_info, ip)
 
-    # 查找现有资产（通过 fingerprint 或 IP 去重）
-    async with _db_lock:
+    # 使用独立 session，避免与调用方的 session 产生并发冲突
+    async with async_session() as db:
+        # 查找现有资产（通过 fingerprint 或 IP 去重）
         existing_asset = await db.execute(
             select(Asset).where(Asset.fingerprint == fingerprint)
         )
@@ -1734,7 +1778,7 @@ async def persist_host_incremental(
                 fingerprint=fingerprint,
                 first_seen=datetime.now(timezone.utc),
                 last_seen=datetime.now(timezone.utc),
-                status="active",
+                is_online=True,
             )
             db.add(asset)
             await db.flush()
@@ -1795,7 +1839,6 @@ async def persist_host_incremental(
                         old_map[key] = dict(new_p)
                 existing_sr.ports = list(old_map.values())
                 # SQLAlchemy JSON 列原地修改后需手动标记 dirty，否则 commit 不会写入
-                from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(existing_sr, "ports")
         else:
             scan_result = ScanResult(
@@ -1813,44 +1856,205 @@ async def persist_host_incremental(
 
 
 # ========================================================================
-# 旧引擎: 主机发现阶段函数（供 host_discovery.py 使用）
+# 旧引擎: 主机发现 — 两阶段 Ping + Top1000
 # ========================================================================
 
-async def _phase1_ping(
-    targets: str,
+def _expand_targets_to_ips(targets: str) -> list[str]:
+    """将扫描目标展开为独立 IP 列表。
+
+    支持: 192.168.1.1, 192.168.1.0/24, 192.168.1.1-50
+    """
+    ips: list[str] = []
+    for part in targets.split():
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            net = ipaddress.ip_network(part, strict=False)
+            ips.extend(str(h) for h in net.hosts())
+            continue
+        except ValueError:
+            pass
+        # 支持 IP 范围: 192.168.1.1-50
+        m = re.match(r'^(\d+\.\d+\.\d+\.)(\d+)-(\d+)$', part)
+        if m:
+            prefix = m.group(1)
+            start, end = int(m.group(2)), int(m.group(3))
+            for i in range(start, end + 1):
+                ips.append(f"{prefix}{i}")
+            continue
+        # 单个 IP 或域名，原样保留
+        ips.append(part)
+    return ips
+
+
+async def _run_host_discovery_legacy(
     scan_task_id: int,
-    scan_mode: str = "standard",
-) -> list[dict]:
-    """主机发现: ping 扫描（-sn）"""
-    scanner = NmapScanner()
-    try:
-        results = await scanner.scan_with_args(
-            targets, ["-sn", "-PE", "-PP", "-PM"],
-            timeout_sec=300,
-        )
-        return results
-    except Exception as e:
-        logger.warning(f"Ping scan failed: {e}")
-        return []
-
-
-async def _phase1_top_ports(
     targets: str,
-    top_ports: int = 1000,
-    scan_task_id: int = 0,
-    scan_mode: str = "standard",
-) -> list[dict]:
-    """主机发现: top 端口快速扫描"""
+    scan_mode: str,
+    max_concurrent: int,
+    all_results: dict[str, dict],
+):
+    """旧引擎: 主机发现 — 两阶段 Ping + Top1000
+
+    阶段1 (0-30%): Ping 探测 (-sn -PE -PP -PM)，记录存活主机数（仅日志参考）
+    阶段2 (30-100%): 对全量 IP 做 Top1000 端口扫描 (-Pn 跳过主机发现)
+
+    阶段2不依赖阶段1存活结果，因为防火墙可能屏蔽 ICMP。
+
+    支持两种模式:
+    - standard: 分组合并扫描（每 max_concurrent 个 IP 合并为一次 nmap 调用）
+    - ip_sequential: 逐 IP 并发扫描（Semaphore 控制并发）
+    """
     scanner = NmapScanner()
-    try:
-        args = ["-sT", "--top-ports", str(top_ports), "-Pn", "-n", "-T4"]
-        results = await scanner.scan_with_args(
-            targets, args, timeout_sec=3600,
+    ip_list = _expand_targets_to_ips(targets)
+
+    if not ip_list:
+        await _append_log_to_task(scan_task_id, "主机发现: 目标为空，跳过")
+        return
+
+    await _append_log_to_task(
+        scan_task_id,
+        f"主机发现开始: {len(ip_list)} 个目标, 模式: {scan_mode}, 并发: {max_concurrent}",
+    )
+
+    # ------------------------------------------------------------------
+    # 阶段1: Ping 探测 (进度 0% → 30%)
+    # ------------------------------------------------------------------
+    await _append_log_to_task(scan_task_id, "阶段1: Ping 探测开始")
+
+    alive_ips: list[str] = []
+
+    if scan_mode == "ip_sequential":
+        # 逐 IP 并发 Ping
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _ping_one(ip: str):
+            async with sem:
+                try:
+                    results = await scanner.scan_with_args(
+                        ip, _build_ping_args(), timeout_sec=120,
+                    )
+                    for r in results:
+                        if r.get("ip"):
+                            _merge_results(all_results, [r])
+                            return r["ip"]
+                except Exception as e:
+                    logger.warning(f"Ping {ip} 失败: {e}")
+            return None
+
+        ping_tasks = [_ping_one(ip) for ip in ip_list]
+        ping_results = await asyncio.gather(*ping_tasks)
+        alive_ips = [ip for ip in ping_results if ip]
+
+    else:
+        # standard: 分组合并 Ping
+        group_size = max(1, max_concurrent)
+        for i in range(0, len(ip_list), group_size):
+            group = ip_list[i:i + group_size]
+            group_targets = " ".join(group)
+            try:
+                results = await scanner.scan_with_args(
+                    group_targets, _build_ping_args(), timeout_sec=300,
+                )
+                _merge_results(all_results, results)
+                for r in results:
+                    if r.get("ip"):
+                        alive_ips.append(r["ip"])
+            except Exception as e:
+                logger.warning(f"Ping 分组 {i // group_size + 1} 失败: {e}")
+
+    # 更新阶段1进度
+    async with async_session() as db:
+        scan_task = await db.get(ScanTask, scan_task_id)
+        if scan_task:
+            await _append_log(db, scan_task,
+                f"阶段1完成: {len(alive_ips)}/{len(ip_list)} 台主机存活")
+            await _update_progress(db, scan_task, 30, all_results)
+
+    # ------------------------------------------------------------------
+    # 阶段2: Top1000 端口扫描 (进度 30% → 100%)
+    # 对全量 IP 扫描（-Pn 跳过主机发现），不依赖阶段1存活结果
+    # 原因: 防火墙可能屏蔽 ICMP，Ping 存活 ≠ 实际存活
+    # ------------------------------------------------------------------
+    await _append_log_to_task(
+        scan_task_id,
+        f"阶段2: Top1000 端口扫描开始, 目标: {len(ip_list)} 个 IP"
+        f" (阶段1存活: {len(alive_ips)})",
+    )
+
+    top_ports_args = _build_tcp_scan_args(top_ports=1000)
+
+    if scan_mode == "ip_sequential":
+        # 逐 IP 并发端口扫描
+        sem = asyncio.Semaphore(max_concurrent)
+        total = len(ip_list)
+        counter = {"done": 0}  # 用 dict 避免闭包 nonlocal 竞态
+
+        async def _scan_ports_one(ip: str):
+            async with sem:
+                try:
+                    results = await scanner.scan_with_args(
+                        ip, top_ports_args, timeout_sec=3600,
+                    )
+                    _merge_results(all_results, results)
+                except Exception as e:
+                    logger.warning(f"Top1000 扫描 {ip} 失败: {e}")
+            counter["done"] += 1
+            # 进度: 30% + (70% * done/total)
+            progress = 30 + int(70 * counter["done"] / total)
+            async with async_session() as db:
+                scan_task = await db.get(ScanTask, scan_task_id)
+                if scan_task:
+                    await _update_progress(db, scan_task, progress, all_results)
+
+        await asyncio.gather(*[_scan_ports_one(ip) for ip in ip_list])
+
+    else:
+        # standard: 分组合并端口扫描
+        group_size = max(1, max_concurrent)
+        total_groups = (len(ip_list) + group_size - 1) // group_size
+        for gi, i in enumerate(range(0, len(ip_list), group_size)):
+            group = ip_list[i:i + group_size]
+            group_targets = " ".join(group)
+            try:
+                results = await scanner.scan_with_args(
+                    group_targets, top_ports_args, timeout_sec=3600,
+                )
+                _merge_results(all_results, results)
+            except Exception as e:
+                logger.warning(f"Top1000 分组 {gi + 1} 失败: {e}")
+
+            # 进度: 30% + (70% * (gi+1)/total_groups)
+            progress = 30 + int(70 * (gi + 1) / total_groups)
+            async with async_session() as db:
+                scan_task = await db.get(ScanTask, scan_task_id)
+                if scan_task:
+                    await _append_log(db, scan_task,
+                        f"阶段2: 分组 {gi + 1}/{total_groups} 完成")
+                    await _update_progress(db, scan_task, progress, all_results)
+
+    # 过滤: 阶段2用 -Pn 扫描，会把所有 IP 都报为 up（即使无开放端口），
+    # 需要剔除这些误判主机；但阶段1 Ping 发现的存活主机应保留
+    alive_set = set(alive_ips)
+    false_positives = [
+        ip for ip, data in all_results.items()
+        if ip not in alive_set and not data.get("ports")
+    ]
+    if false_positives:
+        for ip in false_positives:
+            del all_results[ip]
+        await _append_log_to_task(
+            scan_task_id,
+            f"过滤阶段2无端口主机: 剔除 {len(false_positives)} 个误判 "
+            f"(-Pn 导致)，保留阶段1存活 {len(alive_set)} 台 + 有端口 {len(all_results) - len(alive_set & set(all_results))} 台",
         )
-        return results
-    except Exception as e:
-        logger.warning(f"Top ports scan failed: {e}")
-        return []
+
+    await _append_log_to_task(
+        scan_task_id,
+        f"主机发现完成: 发现 {len(all_results)} 台主机, "
+        f"共 {sum(len(d.get('ports', [])) for d in all_results.values())} 个开放端口",
+    )
 
 
 # ========================================================================
@@ -1874,6 +2078,12 @@ async def _recover_interrupted_tasks():
         for task in running_tasks:
             logger.info(f"恢复中断任务: id={task.id}, targets={task.targets}")
 
+            # 重置状态为 pending，避免 run_service_discovery 跳过
+            task.status = ScanStatus.pending
+            task.current_phase = task.current_phase or ""
+            flag_modified(task, "scan_log")
+            await db.commit()
+
             if task.scan_profile_id:
                 # 新引擎任务: 断点续跑
                 logger.info(f"任务 {task.id}: 新引擎断点恢复")
@@ -1881,9 +2091,6 @@ async def _recover_interrupted_tasks():
             else:
                 # 旧引擎任务: 重新开始
                 logger.info(f"任务 {task.id}: 旧引擎重新执行")
-                task.status = ScanStatus.pending
-                flag_modified(task, "scan_log")
-                await db.commit()
                 asyncio.create_task(execute_scan(task.id))
 
 

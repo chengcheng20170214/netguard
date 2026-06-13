@@ -16,6 +16,7 @@ router = APIRouter(prefix="/api/host-scans", tags=["主机发现"])
 
 
 async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
+    """仅负责调度一次性扫描执行，不处理周期扫描的scheduler注册"""
     import asyncio
     dispatched = False
     try:
@@ -39,13 +40,6 @@ async def _dispatch_scan(task: ScanTask, req: ScanRequest, db: AsyncSession):
         task_handle = asyncio.create_task(execute_scan(task.id))
         task_handle.add_done_callback(lambda t: logger.error(f"Scan task {task.id} failed: {t.exception()}") if t.exception() else None)
 
-    if req.scan_type == ScanType.periodic and req.interval_hours:
-        try:
-            from app.services.scheduler import scheduler_service
-            scheduler_service.add_periodic_scan(task.id, req.interval_hours)
-        except Exception as e:
-            logger.error(f"Failed to register periodic scan: {e}")
-
 
 @router.post("", response_model=ScanTaskResponse)
 async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -57,12 +51,13 @@ async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db),
 
     next_run = None
     if req.scan_type == ScanType.periodic and req.interval_hours:
-        next_run = datetime.now(timezone.utc) + timedelta(hours=req.interval_hours)
+        next_run = datetime.now(timezone.utc)  # scheduler 会立即执行首次扫描
 
     task = ScanTask(
         name=req.name, targets=req.targets, scan_category=ScanCategory.host_discovery,
         scan_type=req.scan_type, scan_mode=req.scan_mode,
         scan_methods=[],  # 主机发现固定两阶段(Ping+Top1000)，scan_methods 不参与调度
+        target_all_assets=req.target_all_assets,  # 周期扫描动态获取所有资产
         ports=req.ports, max_concurrent=req.max_concurrent, interval_hours=req.interval_hours,
         created_by=current_user.id, next_run=next_run,
         is_active=True
@@ -71,7 +66,16 @@ async def create_host_scan(req: ScanRequest, db: AsyncSession = Depends(get_db),
     await db.commit()
     await db.refresh(task)
 
-    await _dispatch_scan(task, req, db)
+    if req.scan_type == ScanType.periodic:
+        # 周期扫描：注册到 scheduler，由 scheduler 立即执行首次扫描
+        try:
+            from app.services.scheduler import scheduler_service
+            scheduler_service.add_periodic_scan(task.id, req.interval_hours)
+        except Exception as e:
+            logger.error(f"Failed to register periodic scan: {e}")
+    else:
+        # 一次性扫描：直接调度执行
+        await _dispatch_scan(task, req, db)
 
     return task
 
@@ -100,14 +104,11 @@ async def get_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), curren
         raise HTTPException(status_code=404, detail="扫描任务不存在")
     results_res = await db.execute(select(ScanResult).where(ScanResult.scan_task_id == scan_id))
     results = results_res.scalars().all()
-    task_data = ScanTaskResponse.model_validate(task).model_dump()
-    task_data["results"] = [ScanResultResponse.model_validate(r).model_dump() for r in results]
-    return task_data
+    return {**task.__dict__, "results": results}
 
 
-@router.put("/{scan_id}", response_model=ScanTaskResponse)
+@router.put("/{scan_id}")
 async def update_host_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """Update a host discovery scan task. Running tasks cannot be edited."""
     result = await db.execute(select(ScanTask).where(ScanTask.id == scan_id))
     task = result.scalar_one_or_none()
     if not task:
@@ -129,7 +130,7 @@ async def update_host_scan(scan_id: int, req: ScanUpdateRequest, db: AsyncSessio
     if req.interval_hours is not None:
         task.interval_hours = req.interval_hours
         if task.scan_type == ScanType.periodic and task.is_active:
-            task.next_run = datetime.now(timezone.utc) + timedelta(hours=req.interval_hours)
+            task.next_run = datetime.now(timezone.utc)  # scheduler 重新注册后会立即执行
             try:
                 from app.services.scheduler import scheduler_service
                 scheduler_service.remove_periodic_scan(task.id)
@@ -160,6 +161,9 @@ async def cancel_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), cur
             scheduler_service.remove_periodic_scan(task.id)
         except Exception as e:
             logger.warning(f"Failed to remove periodic scan {task.id} from scheduler: {e}")
+    # 通知 scan_executor 取消
+    from app.services.scan_executor import request_cancel
+    request_cancel(scan_id)
     task.status = ScanStatus.cancelled
     await db.commit()
     return {"message": "扫描任务已取消"}
@@ -175,7 +179,7 @@ async def activate_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), c
     if task.scan_type != ScanType.periodic:
         raise HTTPException(status_code=400, detail="仅周期扫描可启用/停用")
     task.is_active = True
-    task.next_run = datetime.now(timezone.utc) + timedelta(hours=task.interval_hours)
+    task.next_run = datetime.now(timezone.utc)  # scheduler 会立即执行
     await db.commit()
     try:
         from app.services.scheduler import scheduler_service
@@ -198,6 +202,8 @@ async def deactivate_host_scan(scan_id: int, db: AsyncSession = Depends(get_db),
     task.next_run = None
     if task.status == ScanStatus.running:
         task.status = ScanStatus.cancelled
+        from app.services.scan_executor import request_cancel
+        request_cancel(scan_id)
     await db.commit()
     try:
         from app.services.scheduler import scheduler_service
@@ -228,10 +234,6 @@ async def delete_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), cur
     # Delete scan results first
     from sqlalchemy import delete as sa_delete
     await db.execute(sa_delete(ScanResult).where(ScanResult.scan_task_id == scan_id))
-    # Delete scan chunks
-    from app.models.models import ScanChunk
-    await db.execute(sa_delete(ScanChunk).where(ScanChunk.scan_task_id == scan_id))
-    # Delete the task
     await db.delete(task)
     await db.commit()
     return {"message": "扫描任务已删除"}
@@ -272,35 +274,35 @@ async def rescan_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), cur
     await db.commit()
     await db.refresh(task)
 
-    # Dispatch scan directly without reconstructing ScanRequest
-    # (avoids ScanMethod enum validation errors for legacy data)
-    import asyncio
-    dispatched = False
-    try:
-        from app.tasks.scan_tasks import run_scan_task
-        scan_mode_val = task.scan_mode.value if hasattr(task.scan_mode, 'value') else str(task.scan_mode)
-        await asyncio.wait_for(
-            asyncio.to_thread(
-                run_scan_task.delay,
-                task.id, task.targets, scan_mode_val, task.ports
-            ),
-            timeout=3.0
-        )
-        dispatched = True
-    except Exception as e:
-        logger.error(f"Failed to dispatch rescan via Celery: {e}")
-
-    if not dispatched:
-        from app.services.scan_executor import execute_scan
-        task_handle = asyncio.create_task(execute_scan(task.id))
-        task_handle.add_done_callback(lambda t: logger.error(f"Rescan task {task.id} failed: {t.exception()}") if t.exception() else None)
-
     if task.scan_type == ScanType.periodic and task.is_active and task.interval_hours:
+        # 周期扫描：仅重新注册 scheduler，由 scheduler 立即执行首次扫描
         try:
             from app.services.scheduler import scheduler_service
             scheduler_service.add_periodic_scan(task.id, task.interval_hours)
         except Exception as e:
             logger.error(f"Failed to register periodic rescan: {e}")
+    else:
+        # 一次性扫描：直接调度执行
+        import asyncio
+        dispatched = False
+        try:
+            from app.tasks.scan_tasks import run_scan_task
+            scan_mode_val = task.scan_mode.value if hasattr(task.scan_mode, 'value') else str(task.scan_mode)
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_scan_task.delay,
+                    task.id, task.targets, scan_mode_val, task.ports
+                ),
+                timeout=3.0
+            )
+            dispatched = True
+        except Exception as e:
+            logger.error(f"Failed to dispatch rescan via Celery: {e}")
+
+        if not dispatched:
+            from app.services.scan_executor import execute_scan
+            task_handle = asyncio.create_task(execute_scan(task.id))
+            task_handle.add_done_callback(lambda t: logger.error(f"Rescan task {task.id} failed: {t.exception()}") if t.exception() else None)
 
     await db.refresh(task)
     return task
@@ -309,28 +311,50 @@ async def rescan_host_scan(scan_id: int, db: AsyncSession = Depends(get_db), cur
 @router.websocket("/ws/scan/{task_id}")
 async def scan_ws(websocket: WebSocket, task_id: int, token: str = Query(default="")):
     if not token:
-        await websocket.close(code=4001, reason="Missing authentication token")
+        # Try header-based auth
+        auth_header = websocket.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+
+    if not token:
+        await websocket.close(code=4001, reason="No auth token")
         return
-    payload = decode_token(token)
-    if not payload or payload.get("type") != "access":
-        await websocket.close(code=4001, reason="Invalid or expired token")
+
+    try:
+        payload = decode_token(token)
+        if not payload:
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+    except Exception:
+        await websocket.close(code=4001, reason="Invalid token")
         return
-    await websocket.accept()
+
+    try:
+        await websocket.accept()
+    except Exception:
+        return
+
+    import asyncio
     try:
         while True:
             async with async_session() as db:
                 result = await db.execute(select(ScanTask).where(ScanTask.id == task_id))
                 task = result.scalar_one_or_none()
-                if task:
-                    await websocket.send_json({
-                        "status": task.status.value,
-                        "progress": task.progress,
-                        "scan_log": task.scan_log or [],
-                        "result_summary": task.result_summary or {},
-                    })
-                    if task.status.value in ("completed", "failed", "cancelled"):
-                        break
-            import asyncio
+                if not task:
+                    await websocket.send_json({"error": "Task not found"})
+                    break
+                data = {
+                    "id": task.id,
+                    "status": task.status.value if hasattr(task.status, 'value') else str(task.status),
+                    "progress": task.progress,
+                    "scan_log": task.scan_log[-5:] if task.scan_log else [],
+                    "result_summary": task.result_summary,
+                }
+                await websocket.send_json(data)
+                if task.status in (ScanStatus.completed, ScanStatus.failed, ScanStatus.cancelled):
+                    break
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         pass
+    except Exception as e:
+        logger.error(f"WebSocket error for task {task_id}: {e}")
