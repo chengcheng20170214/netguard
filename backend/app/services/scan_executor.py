@@ -756,6 +756,7 @@ async def _phase1_full_scan(
                 scan_results = await scanner.scan(
                     targets, port_spec,
                     scan_method="nmap_syn_full", scan_mode=scan_mode,
+                    timing=timing,  # 传 timing 配置，避免默认激进参数导致误报
                 )
 
                 # 处理结果
@@ -944,6 +945,10 @@ async def _phase23_service_and_script_with_checkpoint(
     port_config = profile.port_scan or {}
     max_concurrent = port_config.get("max_concurrent", 4)
 
+    # 阶段2+3使用-sT(TCP Connect)，不需要sudo提权
+    use_sudo = False
+    sudo_password = None
+
     svc_enabled = svc_config.get("enabled", False)
     script_enabled = script_config.get("enabled", False)
 
@@ -1012,12 +1017,11 @@ async def _phase23_service_and_script_with_checkpoint(
         args.extend(["--max-scan-delay", f"{timing.get('max_scan_delay_ms', 10)}ms"])
 
         try:
-            # 阶段2+3使用-sT(TCP Connect)，不需要sudo提权
             results = await _run_nmap_with_timeout(
                 ip, args, timeout_sec=nmap_timeout,
                 scan_task_id=scan_task_id,
-                use_sudo=False,
-                sudo_password=None,
+                use_sudo=use_sudo,
+                sudo_password=sudo_password,
             )
 
             for r in results:

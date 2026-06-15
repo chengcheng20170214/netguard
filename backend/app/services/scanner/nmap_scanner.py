@@ -78,6 +78,9 @@ def _build_tcp_scan_args(
     top_ports: int | None = None,
     max_retries: int | None = None,
     min_rate: int | None = None,
+    max_rtt_timeout_ms: int | None = None,
+    initial_rtt_timeout_ms: int | None = None,
+    max_scan_delay_ms: int | None = None,
 ) -> str:
     """构建TCP端口扫描参数（-sT，不需要root）。
 
@@ -113,9 +116,14 @@ def _build_tcp_scan_args(
     parts.extend(["--min-rate", str(rate)])
     if host_timeout_val > 0:
         parts.extend(["--host-timeout", f"{host_timeout_val}s"])
-    parts.extend(["--max-rtt-timeout", f"{settings.SCAN_MAX_RTT_TIMEOUT_MS}ms"])
-    parts.extend(["--initial-rtt-timeout", f"{settings.SCAN_INITIAL_RTT_TIMEOUT_MS}ms"])
-    parts.extend(["--max-scan-delay", f"{settings.SCAN_MAX_SCAN_DELAY_MS}ms"])
+    # RTT timing 参数：支持自定义，否则使用全局默认
+    max_rtt = max_rtt_timeout_ms if max_rtt_timeout_ms is not None else settings.SCAN_MAX_RTT_TIMEOUT_MS
+    initial_rtt = initial_rtt_timeout_ms if initial_rtt_timeout_ms is not None else settings.SCAN_INITIAL_RTT_TIMEOUT_MS
+    max_delay = max_scan_delay_ms if max_scan_delay_ms is not None else settings.SCAN_MAX_SCAN_DELAY_MS
+    
+    parts.extend(["--max-rtt-timeout", f"{max_rtt}ms"])
+    parts.extend(["--initial-rtt-timeout", f"{initial_rtt}ms"])
+    parts.extend(["--max-scan-delay", f"{max_delay}ms"])
 
     parts.extend(["-v", "--reason"])
 
@@ -656,13 +664,21 @@ class NmapScanner(BaseScanner):
     # ----------------------------------------------------------------
 
     async def _scan_full_port_chunked(self, targets: str, ports: str | None, max_concurrent: int = 4, **kwargs) -> list[dict]:
-        """服务发现全端口分块扫描，按端口块并发，支持 on_chunk_done 回调。"""
+        """服务发现全端口分块扫描，按端口块并发，支持 on_chunk_done 回调。
+        
+        kwargs:
+            chunk_size: 端口分块大小
+            on_chunk_done: 分块完成回调
+            progress_callback: 进度回调
+            timing: ScanProfile 的 timing 配置，用于自定义 RTT 参数
+        """
         target_list = _split_targets(targets)
 
         semaphore = asyncio.Semaphore(max_concurrent)
         chunk_size = kwargs.get("chunk_size", settings.SCAN_CHUNK_SIZE)
         on_chunk_done = kwargs.get("on_chunk_done")
         progress_callback = kwargs.get("progress_callback")
+        timing = kwargs.get("timing") or {}
         max_retries = settings.SCAN_CHUNK_MAX_RETRIES
 
         chunk_ranges = _build_port_chunks(chunk_size)
@@ -680,7 +696,13 @@ class NmapScanner(BaseScanner):
             nonlocal completed_tasks
             async with semaphore:
                 port_spec = f"{port_start}-{port_end}"
-                args = _build_tcp_scan_args(port_spec)
+                # 使用 timing 配置（来自 ScanProfile），避免默认激进参数导致误报
+                args = _build_tcp_scan_args(
+                    port_spec,
+                    max_rtt_timeout_ms=timing.get("max_rtt_timeout_ms"),
+                    initial_rtt_timeout_ms=timing.get("initial_rtt_timeout_ms"),
+                    max_scan_delay_ms=timing.get("max_scan_delay_ms"),
+                )
                 nmap_path = settings.NMAP_PATH
                 cmd = [nmap_path] + shlex.split(args) + [segment]
 
