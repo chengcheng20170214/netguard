@@ -699,6 +699,8 @@ class NmapScanner(BaseScanner):
                 # 使用 timing 配置（来自 ScanProfile），避免默认激进参数导致误报
                 args = _build_tcp_scan_args(
                     port_spec,
+                    max_retries=timing.get("max_retries"),
+                    min_rate=timing.get("min_rate"),
                     max_rtt_timeout_ms=timing.get("max_rtt_timeout_ms"),
                     initial_rtt_timeout_ms=timing.get("initial_rtt_timeout_ms"),
                     max_scan_delay_ms=timing.get("max_scan_delay_ms"),
